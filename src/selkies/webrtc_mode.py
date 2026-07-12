@@ -202,7 +202,10 @@ class WebRTCService(BaseStreamingService):
     async def initialize_components(self) -> None:
         """Initialize all application components"""
 
-        if self.args.enable_metrics_http:
+        # Metrics backs BOTH the Prometheus endpoint and the WebRTC CSV statistics,
+        # so build it when either flag is on: CSV-only configs must not leave
+        # self.metrics as None (session start dereferences it for the CSV file).
+        if self.args.enable_metrics_http or self.args.enable_webrtc_statistics:
             webrtc_csv = self.args.enable_webrtc_statistics
             self.metrics = Metrics(using_webrtc_csv=webrtc_csv)
 
@@ -337,7 +340,7 @@ class WebRTCService(BaseStreamingService):
                 entry["position"] = display_position
             await self.rtc_app.start_rtc_connection(session_peer_id, client_type, client_token, display_id)
             # Initialize stats location directory
-            if self.args.enable_webrtc_statistics:
+            if self.args.enable_webrtc_statistics and self.metrics:
                 await self.metrics.initialize_webrtc_csv_file(self.args.webrtc_statistics_dir)
             logger.info(f"started session for client peer id {session_peer_id}")
         except Exception as e:
@@ -453,12 +456,9 @@ class WebRTCService(BaseStreamingService):
         # resolution changes. The WebSocket transport applies scaling through the
         # SETTINGS payload regardless of the resize gate, so wire scaling here too.
         self.input_handler.on_scaling_ratio = self.handle_scaling
-        if self.args.enable_resize:
-            self.input_handler.on_resize = self.on_resize_handler
-        else:
-            self.input_handler.on_resize = lambda res, display_id="primary": logger.warning(
-                f"remote resizing disabled, skipping resize to {res}"
-            )
+        # A secondary display's whole bring-up rides its resize message, so it must not be
+        # gated; enable_resize gates only the primary's dynamic resolution (in on_resize_handler).
+        self.input_handler.on_resize = self.on_resize_handler
 
         # Monitoring callbacks
         self.gpu_monitor.on_stats = self.handle_gpu_stats
@@ -516,7 +516,9 @@ class WebRTCService(BaseStreamingService):
     async def handle_client_werbtc_stats(
         self, webrtc_stat_type: str, webrtc_stats: str
     ) -> None:
-        if self.args.enable_metrics_http:
+        # Gate on the Metrics object itself (built for metrics-http AND/OR the CSV
+        # statistics flag) so CSV-only configs actually ingest the stats they enabled.
+        if self.metrics:
             await self.metrics.set_webrtc_stats(webrtc_stat_type, webrtc_stats)
 
     async def on_resize_handler(self, res: str, display_id: str = "primary") -> None:
@@ -525,6 +527,9 @@ class WebRTCService(BaseStreamingService):
         (or for any secondary), the resolution feeds the extended-desktop layout
         instead (websockets parity)."""
         display_id = display_id or "primary"
+        if display_id == "primary" and not self.args.enable_resize:
+            logger.warning(f"remote resizing disabled, skipping resize to {res}")
+            return
         if display_id != "primary" or self.display_clients:
             try:
                 w_str, h_str = res.split("x")
@@ -1038,8 +1043,6 @@ class WebRTCService(BaseStreamingService):
         if self.args.congestion_control:
             self.tasks.append(asyncio.create_task(self._congestion_control_loop()))
 
-        # Metrics HTTP server is now integrated with aiohttp, no separate server needed
-
         if self.gpu_monitor:
             self.gpu_monitor.start()
         if self.system_monitor:
@@ -1194,7 +1197,6 @@ class WebRTCService(BaseStreamingService):
             stop_coros.append(
                 (_await_with_timeout(self.system_monitor.stop(), "system_monitor", 2.0))
             )
-        # Metrics HTTP server is now integrated with aiohttp, no separate server to stop
 
         if self.mon_hmac_turn:
             stop_coros.append(

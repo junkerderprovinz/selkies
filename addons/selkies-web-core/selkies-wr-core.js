@@ -867,6 +867,11 @@ export default function webrtc() {
 		if (window.isManualResolutionMode && manualWidth && manualHeight) {
 			console.log(`Applying manual resolution: ${manualWidth}x${manualHeight}`);
 			applyManualStyle(manualWidth, manualHeight, scaleLocal);
+			// A secondary display lays out from its reported size, so a manual-mode
+			// secondary must report on connect too; the auto branch below covers the primary.
+			if (window.location.hash.startsWith('#display2')) {
+				sendResolutionToServer(manualWidth, manualHeight);
+			}
 		} else {
 			console.log("Applying window resolution");
 			// If manual resolution is not set, reset to window resolution
@@ -1148,10 +1153,12 @@ export default function webrtc() {
 		if (settings.scaling_dpi !== undefined) {
 			const dpi = parseInt(settings.scaling_dpi, 10);
 			if (!isNaN(dpi) && dpi > 0) {
-				// Persist like ws-core so the value survives a refresh and is
-				// re-applied on connect (loadLastSessionSettings sends s,<dpi>).
+				// Not persisted here: the localStorage pin belongs to the dashboard,
+				// which writes it only for an explicit slider pick. Persisting every
+				// posted value would re-pin the derived-default and reset-to-derived
+				// posts, freezing DPI across displays with different devicePixelRatio
+				// (the connect path derives the DPI when unpinned).
 				scalingDPI = dpi;
-				setIntParam('scaling_dpi', dpi);
 				webrtc.sendDataChannelMessage(`s,${dpi}`);
 			}
 		}
@@ -2107,7 +2114,7 @@ export default function webrtc() {
 			}
 
 			// Apply the fetched (or fallback) RTC config and open the connection.
-			// Extracted so a failed TURN fetch still connects: the data channel is
+			// A shared function, so a failed TURN fetch still connects: the data channel is
 			// what delivers serverSettings, and without it the dashboard never
 			// renders its controls or the WebSocket/WebRTC toggle — i.e. it freezes.
 			const applyRtcConfigAndConnect = (config) => {

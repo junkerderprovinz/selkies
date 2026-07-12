@@ -6,6 +6,7 @@ import argparse
 import os
 import logging
 import re
+import zlib
 from typing import Any, Dict, List
 
 # Settings precedence: CLI flag > SELKIES_<NAME> env > fallback env_var(s) > 'default'.
@@ -28,7 +29,35 @@ from typing import Any, Dict, List
 # One WebSocket message ceiling for BOTH directions: enforced on receive
 # (aiohttp max_msg_size) and advertised to clients so multipart chunk sizing
 # (clipboard, uploads) fills the frame on either end.
-WS_MAX_MESSAGE_BYTES = 8 * 1024 * 1024
+# WS_MESSAGE_SIZE_HARD_CAP is the absolute per-message bound (32 MiB): proxies
+# and WebSocket stacks in the field degrade or reject frames beyond it, so the
+# advertised/enforced value is clamped under it and the server refuses to emit
+# any single frame above it (see _broadcast_to_clients) or to inflate a client
+# 0x05 gzip frame past WS_MAX_MESSAGE_BYTES.
+WS_MESSAGE_SIZE_HARD_CAP = 32 * 1024 * 1024
+WS_MAX_MESSAGE_BYTES = min(8 * 1024 * 1024, WS_MESSAGE_SIZE_HARD_CAP)
+
+
+def inflate_gz_bounded(payload):
+    """Inflate a client gzip payload, bounded by the shared message ceiling.
+
+    The inflated bytes stand in for a raw TEXT message, which could never
+    exceed WS_MAX_MESSAGE_BYTES on either transport (aiohttp's max_msg_size on
+    WebSockets, the negotiated max-message-size on the data channel), so the
+    same budget applies here — an unbounded gzip.decompress would let a single
+    small frame balloon ~1000x into process memory.
+    Raises ValueError for a payload that inflates past the cap, is truncated,
+    or does not decode as UTF-8.
+    """
+    d = zlib.decompressobj(wbits=31)  # gzip container
+    inflated = d.decompress(payload, WS_MAX_MESSAGE_BYTES + 1)
+    if len(inflated) > WS_MAX_MESSAGE_BYTES:
+        raise ValueError(
+            f"inflates past the {WS_MAX_MESSAGE_BYTES}-byte per-message ceiling"
+        )
+    if not d.eof:
+        raise ValueError("truncated gzip stream")
+    return inflated.decode("utf-8")
 
 SETTING_DEFINITIONS: List[Dict[str, Any]] = [
     # -------------------- Common Settings for both modes --------------------
@@ -993,11 +1022,22 @@ class AppSettings:
                             # the web UI (the server accepts more than the UI offers).
                             vr = setting.get("meta", {}).get("value_range")
                             in_range_value = None
-                            if not valid_items and stype == "enum" and vr and len(user_items) == 1:
+                            # Gate on value_range presence, NOT on `not valid_items`:
+                            # a single in-range value that happens to equal a curated
+                            # stop must still keep the full menu (the whole point of
+                            # value_range is that the server accepts more than the UI
+                            # shows). Excluding on-stop values collapsed the dropdown
+                            # to that one option.
+                            if stype == "enum" and vr and len(user_items) == 1:
                                 try:
                                     n = float(user_items[0])
                                     if vr[0] <= n <= vr[1]:
-                                        in_range_value = user_items[0]
+                                        # Normalize to canonical integer form so a
+                                        # decimal-formatted override ('128000.0')
+                                        # can't crash downstream int() consumers.
+                                        in_range_value = (
+                                            str(int(n)) if n == int(n) else user_items[0]
+                                        )
                                 except ValueError:
                                     pass
                             if in_range_value is not None:
@@ -1112,8 +1152,13 @@ class AppSettings:
                     )
                     processed_value = (min_val, max_val)
             processed[name] = processed_value
-        width_overridden = overrides.get("manual_width", False)
-        height_overridden = overrides.get("manual_height", False)
+        # A manual dimension activates manual mode only when it is a POSITIVE value.
+        # 0 is both the built-in default and the "no manual width" sentinel, so a
+        # templated launcher emitting `--manual-width 0` for an unset field must not
+        # silently lock the display to 1024x768. (An explicit is_manual_resolution_mode
+        # override still forces manual mode via manual_mode_bool_is_set below.)
+        width_overridden = overrides.get("manual_width", False) and processed.get("manual_width", 0) > 0
+        height_overridden = overrides.get("manual_height", False) and processed.get("manual_height", 0) > 0
         manual_mode_bool_is_set = processed.get(
             "is_manual_resolution_mode", (False, False)
         )[0]

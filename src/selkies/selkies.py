@@ -35,7 +35,7 @@ from .display_utils import (
     set_cursor_size,
 )
 from .input_handler import WebRTCInput as InputHandler, CLIPBOARD_CHUNK_SIZE
-from .settings import settings, SETTING_DEFINITIONS, WS_MAX_MESSAGE_BYTES, build_client_settings_payload
+from .settings import settings, SETTING_DEFINITIONS, WS_MAX_MESSAGE_BYTES, WS_MESSAGE_SIZE_HARD_CAP, build_client_settings_payload, inflate_gz_bounded
 from .stream_server import BaseStreamingService
 
 # Constants
@@ -176,6 +176,7 @@ INT_SETTING_DEFAULT_MIN = -1_000_000
 # Matches the WebRTC DataChannel threshold so both transports behave identically.
 WS_GZIP_MIN_BYTES = 512
 
+
 def _path_is_within(directory, target):
     """Return True if `target` is `directory` itself or strictly inside it.
 
@@ -209,9 +210,27 @@ async def _broadcast_to_clients(clients, message, per_client_timeout=None):
     When per_client_timeout is set, a client whose send stalls past the bound is
     treated as dead: the send is cancelled and the socket is dropped and closed. A
     cancelled send_str may have left a half-written frame on the wire, so that socket
-    must never be reused for later sends."""
+    must never be reused for later sends.
+
+    Returns the set of clients dropped by this call. Removal mutates the PASSED
+    collection, so callers that fan out over a computed temporary set (the media
+    senders) must subtract the returned set from their authoritative registry
+    themselves — otherwise the dead socket re-enters the very next per-frame set."""
     if not clients:
-        return
+        return set()
+
+    # Hard per-frame ceiling, both text and binary. Nothing legitimate reaches
+    # it — large control payloads (clipboard) are segmented far below
+    # WS_MAX_MESSAGE_BYTES before they get here — so an oversized message is an
+    # upstream bug, and emitting it would trip proxy/WS-stack frame limits and
+    # stall the socket. Refuse loudly instead of sending. (len() equals the
+    # byte count for every large control message: they are base64/ASCII-JSON.)
+    if len(message) > WS_MESSAGE_SIZE_HARD_CAP:
+        data_logger.error(
+            f"Refusing to broadcast a {len(message)}-byte WebSocket message "
+            f"(hard cap {WS_MESSAGE_SIZE_HARD_CAP} bytes); message dropped."
+        )
+        return set()
 
     async def _send_one(client):
         if isinstance(message, (bytes, bytearray, memoryview)):
@@ -233,7 +252,7 @@ async def _broadcast_to_clients(clients, message, per_client_timeout=None):
         client = next(iter(clients))
         if client.closed:
             clients.discard(client)
-            return
+            return {client}
         try:
             if per_client_timeout is not None:
                 await asyncio.wait_for(_send_one(client), timeout=per_client_timeout)
@@ -243,14 +262,16 @@ async def _broadcast_to_clients(clients, message, per_client_timeout=None):
             # Stalled send was cancelled; the socket is no longer safe to reuse.
             clients.discard(client)
             _close_abandoned_ws(client)
+            return {client}
         except ConnectionResetError:
             clients.discard(client)
+            return {client}
         except (OSError, RuntimeError) as result:
             if any(term in str(result).lower() for term in ['broken pipe', 'connection reset', 'closed']):
                 clients.discard(client)
-            else:
-                data_logger.warning(f"Broadcast exception (client not removed): {type(result).__name__}: {result}")
-        return
+                return {client}
+            data_logger.warning(f"Broadcast exception (client not removed): {type(result).__name__}: {result}")
+        return set()
 
     client_task_pairs = []
     closed_clients = set()
@@ -291,6 +312,7 @@ async def _broadcast_to_clients(clients, message, per_client_timeout=None):
 
     if closed_clients:
         clients -= closed_clients
+    return closed_clients
 
 class SelkiesAppError(Exception):
     pass
@@ -738,10 +760,15 @@ class DataStreamingServer(BaseStreamingService):
                 self._bytes_sent_in_interval += len(message_to_send) * len(primary_viewers)
                 # Bounded sends: one stalled socket must not freeze the shared
                 # audio stream (a timed-out client is dropped and closed).
-                await _broadcast_to_clients(
+                dropped = await _broadcast_to_clients(
                     primary_viewers, message_to_send,
                     per_client_timeout=SHARED_STREAM_SEND_TIMEOUT_SECONDS,
                 )
+                if dropped:
+                    # primary_viewers is a per-chunk temporary: propagate the drop
+                    # to the authoritative registry, or the dead socket re-enters
+                    # the fan-out on the very next chunk.
+                    self.clients -= dropped
 
                 self.pcmflux_audio_queue.task_done()
         except asyncio.CancelledError:
@@ -1655,6 +1682,10 @@ class DataStreamingServer(BaseStreamingService):
         # Per-connection stats sender; the system/gpu/network collectors it reads
         # from are instance-wide singletons created/torn down on self.
         stats_sender_task_ws = None
+        # Per-connection START_AUDIO worker: it blocks on client_settings_received
+        # (which may never be set), so it must be cancelled with the connection
+        # rather than left to run audio ops for a departed client.
+        start_audio_task_ws = None
 
         mic_setup_done = False
         mic_disabled_sent = False
@@ -1768,7 +1799,10 @@ class DataStreamingServer(BaseStreamingService):
                 if (msg.type == WSMsgType.BINARY and msg.data
                         and msg.data[0] == 0x05):
                     try:
-                        _text = gzip.decompress(msg.data[1:]).decode("utf-8")
+                        _text = inflate_gz_bounded(msg.data[1:])
+                    except ValueError as e:
+                        data_logger.warning(f"Dropping client gzip frame: {e}")
+                        continue
                     except Exception:
                         data_logger.warning("Dropping undecodable client gzip frame.")
                         continue
@@ -2236,6 +2270,14 @@ class DataStreamingServer(BaseStreamingService):
                                 acked_frame_id = int(parts[-1])
                             else:
                                 raise ValueError("ACK message has too few parts.")
+                            # Sent ids are masked to uint16 (& 0xFFFF), so any ack
+                            # outside that wire space is a protocol violation. The
+                            # -1 'no ACK yet' sentinel is server-internal: accepting
+                            # it (or any out-of-range int) from the wire would let a
+                            # client disable backpressure and the stall detector, or
+                            # skew the circular desync arithmetic.
+                            if not (0 <= acked_frame_id <= MAX_UINT16_FRAME_ID):
+                                raise ValueError("ACK frame id outside uint16 wire space.")
 
                             display_state = self.display_clients.get(target_display_id)
                             if display_state:
@@ -2437,7 +2479,11 @@ class DataStreamingServer(BaseStreamingService):
                                 else:
                                     data_logger.warning("START_AUDIO: Cannot start server-to-client audio (pcmflux not available).")
                                     await websocket.send_str("AUDIO_DISABLED")
-                        asyncio.create_task(_handle_start_audio_request())
+                        # Track per-connection: a re-request supersedes the pending
+                        # one, and disconnect cleanup cancels whatever is in flight.
+                        if start_audio_task_ws and not start_audio_task_ws.done():
+                            start_audio_task_ws.cancel()
+                        start_audio_task_ws = asyncio.create_task(_handle_start_audio_request())
 
                     elif message == "STOP_AUDIO":
                         async with self._reconfigure_guard():
@@ -2685,10 +2731,11 @@ class DataStreamingServer(BaseStreamingService):
                 data_logger.info("Last consumer disconnected; stopping viewer-started primary capture.")
                 await self._stop_capture_for_display('primary')
 
-            # Cancel only the per-connection stats sender; the singleton collectors
+            # Cancel only the per-connection tasks; the singleton collectors
             # are torn down on last-client disconnect (cancelling here breaks remaining clients).
             monitor_tasks = [
                 stats_sender_task_ws,
+                start_audio_task_ws,
             ]
             for _task_to_cancel in monitor_tasks:
                 if _task_to_cancel and not _task_to_cancel.done():
@@ -3267,11 +3314,16 @@ class DataStreamingServer(BaseStreamingService):
                     try:
                         # Bounded sends: a stalled shared viewer must not freeze
                         # primary video for the controller and other viewers.
-                        await _broadcast_to_clients(
+                        dropped = await _broadcast_to_clients(
                             send_targets, data_chunk,
                             per_client_timeout=SHARED_STREAM_SEND_TIMEOUT_SECONDS,
                         )
                         self._bytes_sent_in_interval += len(data_chunk) * len(send_targets)
+                        if dropped:
+                            # send_targets is a per-frame temporary: propagate the
+                            # drop to the authoritative registry, or the dead socket
+                            # re-enters the fan-out on the very next frame.
+                            self.clients -= dropped
                     except Exception as e:
                         data_logger.error(f"Error during primary broadcast: {e}")
 
@@ -3288,8 +3340,24 @@ class DataStreamingServer(BaseStreamingService):
                     if len(client_info['sent_timestamps']) > SENT_FRAME_TIMESTAMP_HISTORY_SIZE:
                         client_info['sent_timestamps'].popitem(last=False)
                     try:
-                        await websocket.send_bytes(data_chunk)
+                        # Bounded send, matching the primary path: a wedged secondary
+                        # socket must not pin this sender inside the await, where the
+                        # backpressure gate (checked only at loop top) can never
+                        # preempt it. A cancelled send may leave a half-written
+                        # frame, so the socket is dropped and closed, not reused.
+                        await asyncio.wait_for(
+                            websocket.send_bytes(data_chunk),
+                            timeout=SHARED_STREAM_SEND_TIMEOUT_SECONDS,
+                        )
                         self._bytes_sent_in_interval += len(data_chunk)
+                    except asyncio.TimeoutError:
+                        # Checked before OSError: on 3.11+ TimeoutError subclasses it.
+                        data_logger.warning(
+                            f"Client for '{display_id}' send stalled past "
+                            f"{SHARED_STREAM_SEND_TIMEOUT_SECONDS}s; dropping."
+                        )
+                        _close_abandoned_ws(websocket)
+                        break
                     except (ConnectionResetError, OSError, RuntimeError):
                         data_logger.warning(f"Client for '{display_id}' connection closed during send.")
                         break
