@@ -68,6 +68,9 @@ export class Queue {
     }
 }
 
+import { PROBE_CODEC_STRINGS, PROBE_FULLCOLOR_STRINGS, codecOfEncoder, codecCarriesFullColor } from "./wire-codecs.js";
+export { codecOfEncoder, codecCarriesFullColor };
+
 /**
  * Human-readable names for the wire values surfaced in UIs (transport modes,
  * encoders, rate-control modes). The raw values are what the server APIs
@@ -79,13 +82,20 @@ export const DISPLAY_LABELS = {
     websockets: "WebSockets",
     webrtc: "WebRTC",
     h264enc: "H.264 (Full Frame)",
+    h265enc: "H.265 (Full Frame)",
+    vp8enc: "VP8 (Full Frame)",
+    vp9enc: "VP9 (Full Frame)",
+    av1enc: "AV1 (Full Frame)",
     "h264enc-striped": "H.264 (Striped Frame)",
     jpeg: "JPEG (Striped Frame)",
     cbr: "CBR (Constant Bitrate)",
     crf: "CRF (Constant Quality)",
     auto: "Auto",
     h264: "H.264",
+    h265: "H.265",
     vp8: "VP8",
+    vp9: "VP9",
+    av1: "AV1",
     mjpeg: "MJPEG",
 };
 
@@ -96,58 +106,124 @@ export const DISPLAY_LABELS = {
 export const displayLabel = (value) => DISPLAY_LABELS[value] ?? value;
 
 /**
+ * Whether a `VideoDecoder` here accepts `codec` at `width` x `height`. False
+ * without WebCodecs, and when the engine throws on the question.
+ * @param {string} codec A WebCodecs codec string.
+ * @param {number} width
+ * @param {number} height
+ * @returns {Promise<boolean>}
+ */
+async function decoderAccepts(codec, width, height) {
+    if (typeof VideoDecoder === "undefined") return false;
+    try {
+        const support = await VideoDecoder.isConfigSupported({ codec, codedWidth: width, codedHeight: height });
+        return !!(support && support.supported);
+    } catch (err) {
+        return false;
+    }
+}
+
+/**
+ * What this engine's `VideoDecoder` said to each codec's representative
+ * configuration, once the probe has run; `null` until then. A decoder can
+ * accept a configuration and still fail at `decode()`, which the core's
+ * fallback ladder answers; this only keeps the settings from offering what the
+ * engine refuses outright.
+ * @type {Object<string, boolean>|null}
+ */
+let decoderSupport = null;
+
+/**
+ * Resolves once every codec has been asked of the decoder. Menus built before
+ * it resolves offer every codec an engine with WebCodecs might play, and are
+ * rebuilt from the answer.
+ * @type {Promise<Object<string, boolean>>}
+ */
+export const decoderSupportReady = (async () => {
+    const answers = {};
+    for (const [codec, string] of Object.entries(PROBE_CODEC_STRINGS)) {
+        answers[codec] = await decoderAccepts(string, 1280, 720);
+    }
+    decoderSupport = answers;
+    return answers;
+})();
+
+/**
  * Whether this engine can play an encoder on the WebSocket transport: every
- * H.264 mode decodes through WebCodecs' `VideoDecoder`, while `jpeg` (striped
- * JPEG painted through `createImageBitmap`) needs nothing. An engine without
- * WebCodecs therefore still streams: the core's pre-flight pins `jpeg` instead
- * of failing, and the settings offer nothing it cannot play. The WebRTC
- * transport decodes in the browser's media stack and is not subject to this.
+ * video mode decodes through WebCodecs' `VideoDecoder`, whose answer per codec
+ * is read once it is in, while `jpeg` (striped JPEG painted through
+ * `createImageBitmap`) needs nothing. An engine without WebCodecs therefore
+ * still streams: the core's pre-flight pins `jpeg` instead of failing, and the
+ * settings offer nothing it cannot play. The WebRTC transport decodes in the
+ * browser's media stack and is not subject to this.
  * @param {string} encoder An encoder wire value.
  * @returns {boolean}
  */
-export const canDecodeEncoder = (encoder) => encoder === "jpeg" || typeof VideoDecoder !== "undefined";
+export const canDecodeEncoder = (encoder) => {
+    if (encoder === "jpeg") return true;
+    if (typeof VideoDecoder === "undefined") return false;
+    return decoderSupport === null || decoderSupport[codecOfEncoder(encoder)] !== false;
+};
 /**
  * @param {string[]} encoders Encoder wire values.
  * @returns {string[]} Those `canDecodeEncoder` accepts.
  */
 export const decodableEncoders = (encoders) => encoders.filter(canDecodeEncoder);
 
-/** Cached answer of `canDecodeFullColor`, so the probe runs once. */
-let fullColorProbe = null;
+/** RTP MIME type each WebRTC encoder streams. */
+const RTC_MIME_TYPES = {
+    h264enc: "video/h264", h265enc: "video/h265", vp8enc: "video/vp8", vp9enc: "video/vp9", av1enc: "video/av1",
+};
 
 /**
- * Whether this engine's `VideoDecoder` will take H.264 full colour (4:4:4).
- *
- * Engines differ on High 4:4:4 Predictive, and one whose decoder lacks it
- * cannot show the stream at all rather than showing it worse, so full colour
- * is asked of the decoder before it is asked of the server. Which engines have
- * it changes with their releases, which is why this probes instead of naming
- * them.
- *
- * The profile is the whole question, so it is asked in the least demanding
- * form that can carry it: `F4` with no constraint bits set, which is what the
- * encoders emit and the only spelling engines accept -- setting them names the
- * Intra-only variant and is refused -- at the smallest frame the level allows,
- * since a level is a ceiling and a size beyond it is a pair an implementation
- * may reject on its own. What a real stream is decoded with comes from its
- * keyframe's SPS instead.
- * @returns {Promise<boolean>} False where there is no `VideoDecoder` at all.
+ * Whether this engine's own WebRTC stack receives an encoder's codec, from
+ * `RTCRtpReceiver.getCapabilities`; an engine that cannot answer the question
+ * is given the benefit of the doubt, and the server's negotiation fallback
+ * answers a codec it declines.
+ * @param {string} encoder An encoder wire value.
+ * @returns {boolean}
  */
-export function canDecodeFullColor() {
-    if (!fullColorProbe) {
-        fullColorProbe = (async () => {
-            if (typeof VideoDecoder === "undefined") return false;
-            try {
-                const support = await VideoDecoder.isConfigSupported({
-                    codec: "avc1.F4001E", codedWidth: 320, codedHeight: 240,
-                });
-                return !!(support && support.supported);
-            } catch (err) {
-                return false;
-            }
-        })();
+export const canReceiveEncoder = (encoder) => {
+    const mime = RTC_MIME_TYPES[encoder];
+    if (!mime) return false;
+    try {
+        const caps = RTCRtpReceiver.getCapabilities("video");
+        if (!caps || !Array.isArray(caps.codecs)) return true;
+        return caps.codecs.some((c) => typeof c.mimeType === "string" && c.mimeType.toLowerCase() === mime);
+    } catch (err) {
+        return true;
     }
-    return fullColorProbe;
+};
+/**
+ * @param {string[]} encoders Encoder wire values.
+ * @returns {string[]} Those `canReceiveEncoder` accepts.
+ */
+export const receivableEncoders = (encoders) => encoders.filter(canReceiveEncoder);
+
+/** Cached answers of `canDecodeFullColor`, one probe per codec. */
+const fullColorProbes = {};
+
+/**
+ * Whether this engine's `VideoDecoder` will take `codec` at full colour (4:4:4).
+ *
+ * Engines differ on the 4:4:4 profiles (High 4:4:4 Predictive, HEVC RExt), and
+ * one whose decoder lacks them cannot show the stream at all rather than
+ * showing it worse, so full colour is asked of the decoder before it is asked
+ * of the server. Which engines have them changes with their releases, which is
+ * why this probes instead of naming them. The profile is the whole question,
+ * so it is asked with the constraint bits the encoders emit, at the smallest
+ * frame the level allows, since a level is a ceiling and a size beyond it is a
+ * pair an implementation may reject on its own. What a real stream is decoded
+ * with comes from its key frame's parameter sets instead.
+ * @param {string} [codec] The codec name, `h264` by default.
+ * @returns {Promise<boolean>} False for a codec without 4:4:4, and where there
+ *     is no `VideoDecoder` at all.
+ */
+export function canDecodeFullColor(codec = "h264") {
+    const string = PROBE_FULLCOLOR_STRINGS[codec];
+    if (!string) return Promise.resolve(false);
+    if (!fullColorProbes[codec]) fullColorProbes[codec] = decoderAccepts(string, 320, 240);
+    return fullColorProbes[codec];
 }
 
 /**

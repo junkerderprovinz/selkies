@@ -91,7 +91,7 @@ def make_settings(encoder: str = "h264enc", w: int = 1024, h: int = 640, **kw):
     cs.video_fullcolor = False
     cs.use_paint_over_quality = False
     cs.jpeg_quality = 90
-    cs.output_mode = 1
+    cs.codec = "h264"
     cs.video_fullframe = True
     for k, v in kw.items():
         setattr(cs, k, v)
@@ -396,8 +396,8 @@ def main() -> Results:
 
     try:
         j = make_settings(w=320, h=200)
-        # output_mode 0 selects JPEG, which the recorder must reject.
-        j.output_mode = 0
+        # JPEG capture settings, which the recorder must reject.
+        j.codec = "jpeg"
         j.video_fullframe = False
         try:
             pixelflux.start_recording(os.path.join(H.WORKDIR, "cap2-rec-jpg.mp4"), j)

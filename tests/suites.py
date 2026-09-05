@@ -69,6 +69,8 @@ SUITES: list = [
     {"path": "unit/test_https_selfsigned.py", "tier": "unit", "timeout": 120},
     {"path": "unit/test_encoder_cpu_policy.py", "tier": "unit", "timeout": 120},
     {"path": "unit/test_rate_control_defaults.py", "tier": "unit", "timeout": 180},
+    {"path": "unit/test_codec_encoders.py", "tier": "unit", "timeout": 120},
+    {"path": "unit/test_rtp_packetizers.py", "tier": "unit", "timeout": 120},
     {"path": "unit/test_transfer_pacer.py", "tier": "unit", "timeout": 180},
     {"path": "unit/test_webrtc_pacer_brake.py", "tier": "unit", "timeout": 120},
     {"path": "unit/test_nvml_failfast.py", "tier": "unit", "timeout": 120},
@@ -216,6 +218,8 @@ SUITES: list = [
      "selectors": ["ws-x11", "wr-x11", "ws-wl", "wr-wl"]},
     {"path": "e2e/test_encoders.py", "tier": "e2e", "timeout": 900,
      "selectors": ["ws-x11", "wr-x11", "ws-wl", "wr-wl"]},
+    {"path": "e2e/test_codecs.py", "tier": "e2e", "timeout": 2400,
+     "selectors": ["ws-x11", "ws-wl", "wr-x11"]},
     {"path": "e2e/test_ws_unix_socket.py", "tier": "e2e", "timeout": 600},
 
     # on request

@@ -25,7 +25,7 @@ in-process pixelflux handle, never through forked tools.
 
 Wire framing: text frames carry the control verbs; binary frames are typed
 by their first byte — 0x01 Opus audio (pcmflux's native header, sent as-is),
-0x03 JPEG and 0x04 H.264 video stripes from pixelflux, 0x02 client mic PCM,
+0x03 JPEG and 0x04 video stripes from pixelflux, 0x02 client mic PCM,
 `WS_OPCODE_WEBCAM` a webcam frame for the virtual camera, and 0x05 a gzip
 wrapped control text. A client that sends `_gz,1` can inflate gzip: control
 text at or above `WS_GZIP_MIN_BYTES` then goes out as 0x05 frames (small,
@@ -102,7 +102,7 @@ from .input_handler import (
     VIEWER_SILENT_DROP_PREFIXES,
     run_client_command,
 )
-from .settings import settings, SETTING_DEFINITIONS, WS_MAX_MESSAGE_BYTES, WS_MESSAGE_SIZE_HARD_CAP, build_client_settings_payload, effective_use_cpu, inflate_gz_bounded, pipeline_starts_on, sanitize_client_setting
+from .settings import settings, SETTING_DEFINITIONS, WS_MAX_MESSAGE_BYTES, WS_MESSAGE_SIZE_HARD_CAP, build_client_settings_payload, codec_for_encoder, effective_use_cpu, inflate_gz_bounded, pipeline_starts_on, sanitize_client_setting
 from .settings import settings as app_settings
 from .webcam import (
     MSG_WEBCAM_DISABLED,
@@ -184,7 +184,7 @@ AUDIO_CHANNELS_DEFAULT = 2
 # An operator override of the audio_bitrate enum reaches here as an arbitrary
 # numeric string; a fractional value must not abort module import.
 AUDIO_BITRATE_DEFAULT = int(float(settings.audio_bitrate))
-PIXELFLUX_VIDEO_ENCODERS = ["jpeg", "h264enc", "h264enc-striped"]
+PIXELFLUX_VIDEO_ENCODERS = ["jpeg", "h264enc", "h264enc-striped", "h265enc", "vp8enc", "vp9enc", "av1enc"]
 
 LOGLEVEL = logging.INFO
 logging.basicConfig(level=LOGLEVEL)
@@ -638,7 +638,7 @@ class _VideoRelay:
     broadcast-video contract. Keyframes are exempt from the budget (part of
     one is useless), so the true bound is budget plus one keyframe burst.
 
-    H.264 chain safety is tracked per stripe ROW (wire-header y_start, bytes
+    Video reference-chain safety is tracked per stripe ROW (wire-header y_start, bytes
     4:6): one capture frame can mix IDR and delta stripes (a lone stripe
     encoder re-init IDRs only its own row), so after any drop a row's delta
     chunks stay gated until that row's own IDR arrives — a delivered delta
@@ -721,8 +721,8 @@ class _VideoRelay:
         """
         data = item['data']
         size = len(data)
-        is_h264 = size >= 10 and data[0] == 0x04
-        is_idr = is_h264 and data[1] == 0x01
+        is_video = size >= 10 and data[0] == 0x04
+        is_idr = is_video and (data[1] & 0x0F) == 0x01
         dropped = False
         if (not is_idr and self.backlog
                 and self.backlog_bytes + size > self.budget):
@@ -731,7 +731,7 @@ class _VideoRelay:
             self.live_rows.clear()
             dropped = True
         deliver = True
-        if is_h264:
+        if is_video:
             row = (data[4] << 8) | data[5]
             if is_idr:
                 self.live_rows.add(row)
@@ -5636,12 +5636,10 @@ class DataStreamingServer(BaseStreamingService):
         cs.capture_x = x
         cs.capture_y = y
         encoder = display_state.get('encoder', self.app.encoder)
-        if encoder == "jpeg":
-            cs.output_mode = 0
+        cs.codec = codec_for_encoder(encoder)
+        if cs.codec == "jpeg":
             cs.jpeg_quality = display_state.get('jpeg_quality', self._initial_jpeg_quality)
             cs.paint_over_jpeg_quality = display_state.get('paint_over_jpeg_quality', self._initial_paint_over_jpeg_quality)
-        else:
-            cs.output_mode = 1
         ih = getattr(self, 'input_handler', None)
         apply_common_capture_settings(
             cs, self.cli_args,

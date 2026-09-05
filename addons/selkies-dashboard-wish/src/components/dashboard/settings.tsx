@@ -33,7 +33,7 @@
  */
 
 import { Card, CardContent } from "@/components/ui/card";
-import { displayLabel, decodableEncoders, canDecodeFullColor } from "../../../../selkies-web-core/lib/util.js";
+import { displayLabel, decodableEncoders, receivableEncoders, decoderSupportReady, canDecodeFullColor, codecOfEncoder, codecCarriesFullColor } from "../../../../selkies-web-core/lib/util.js";
 import { sessionAuthHeaders } from "../../../../selkies-web-core/lib/session-token.js";
 import { resolveSpec, isSettingPinned, HIDPI_SPEC, RATE_CONTROL_SPEC,
     USE_BROWSER_CURSORS_SPEC, VIDEO_FULLCOLOR_SPEC, VIDEO_STREAMING_MODE_SPEC,
@@ -108,6 +108,10 @@ const commonResolutionValues = [
 
 const encoderOptions = [
     "h264enc",
+    "h265enc",
+    "vp8enc",
+    "vp9enc",
+    "av1enc",
     "h264enc-striped",
     "jpeg",
 ];
@@ -121,10 +125,14 @@ const webcamEncoderOptions = ["auto", "h264", "vp8", "mjpeg"];
 
 const encoderOptionsRTC = [
     "h264enc",
+    "h265enc",
+    "vp8enc",
+    "vp9enc",
+    "av1enc",
 ];
 
 /** Encoders that support both CBR and CRF (constant-QP) rate control. */
-const H264_ENCODERS = ["h264enc", "h264enc-striped", "nvh264enc"];
+const VIDEO_ENCODERS = ["h264enc", "h265enc", "vp8enc", "vp9enc", "av1enc", "h264enc-striped"];
 
 const FRAMERATE_STEPS = [8, 12, 15, 24, 25, 30, 48, 50, 60, 90, 100, 120, 144, 165, 240];
 
@@ -242,13 +250,25 @@ export function Settings() {
 
     /**
      * On the WebSocket transport only encoders this engine can decode are
-     * offered (jpeg alone without WebCodecs).
+     * offered (jpeg alone without WebCodecs), on WebRTC those its RTP
+     * receiver takes.
      */
     const offeredEncoders = useCallback(
-        (list: string[]): string[] => (isWebrtc ? list : decodableEncoders(list)), [isWebrtc]);
+        (list: string[]): string[] => (isWebrtc ? receivableEncoders(list) : decodableEncoders(list)), [isWebrtc]);
     const [dynamicEncoderOptions, setDynamicEncoderOptions] = useState(
         offeredEncoders(isWebrtc ? encoderOptionsRTC : encoderOptions)
     );
+    // The decoder probe answers after the first render; the menu is rebuilt from
+    // whatever list is current once it has.
+    const serverEncoderList = serverSettings?.encoder?.allowed;
+    useEffect(() => {
+        let live = true;
+        decoderSupportReady.then(() => {
+            if (!live) return;
+            setDynamicEncoderOptions(offeredEncoders(serverEncoderList || (isWebrtc ? encoderOptionsRTC : encoderOptions)));
+        });
+        return () => { live = false; };
+    }, [serverEncoderList, isWebrtc, offeredEncoders]);
 
     const [manualWidth, setManualWidth] = useState(() =>
         localStorage.getItem(getPrefixedKey("manual_width")) || ''
@@ -298,7 +318,7 @@ export function Settings() {
         manualActive: !!readStored("manual_width") || serverSettings?.manual_resolution?.value === true,
         streamMode,
         activeEncoder: readStored("encoder") || encoder,
-        softwareH264Encoder: serverSettings?.software_h264_encoder?.value,
+        softwareEncoders: serverSettings?.software_encoders?.value,
         useCpu: readStored("use_cpu") !== null
             ? readStored("use_cpu") === "true" : !!serverSettings?.use_cpu?.value,
         allowedRateControl: serverSettings?.rate_control_mode?.allowed || rateControlOptions,
@@ -390,7 +410,13 @@ export function Settings() {
     // Full colour is 4:4:4 H.264; where the decoder has no such profile the core
     // turns it off, so offering the switch would offer nothing.
     const [fullColorDecodable, setFullColorDecodable] = useState(true);
-    useEffect(() => { canDecodeFullColor().then(setFullColorDecodable); }, []);
+    /** Full colour is offered only where the codec carries it and this engine decodes it. */
+    const fullColorCodec = codecOfEncoder(encoder);
+    useEffect(() => {
+        let live = true;
+        canDecodeFullColor(fullColorCodec).then((ok) => { if (live) setFullColorDecodable(ok); });
+        return () => { live = false; };
+    }, [fullColorCodec]);
     const [videoStreamingMode, setVideoStreamingMode] = useConditionalSetting(
         VIDEO_STREAMING_MODE_SPEC, serverSettings, conditionalCtx, [serverSettings]);
     // Pre-settings fallbacks mirror the server defaults (settings.py).
@@ -1010,7 +1036,8 @@ export function Settings() {
     const dpiScalingDisabled = !serverSettings || serverSettings.scaling_dpi?.allowed?.length <= 1
         || serverSettings.scaling_dpi?.overridden === true;
     const activeEncoder = encoder;
-    const isH264 = H264_ENCODERS.includes(activeEncoder);
+    const isH264 = VIDEO_ENCODERS.includes(activeEncoder);
+    const showFullColor = isH264 && codecCarriesFullColor(codecOfEncoder(activeEncoder));
     const showJpegOptions = !isWebrtc && activeEncoder === 'jpeg';
     const showRateControl = rateControlEnabled && isH264;
     /**
@@ -1401,7 +1428,7 @@ export function Settings() {
                         {/* Paint-over, Turbo and 4:4:4 are pixelflux encoder features shared by both transports. */}
                         {isH264 && (
                             <>
-                                {(renderableSettings.videoFullColor ?? true) && fullColorDecodable && (
+                                {showFullColor && (renderableSettings.videoFullColor ?? true) && fullColorDecodable && (
                                 <div className="flex items-center justify-between">
                                     <div className="space-y-0.5">
                                         <label className="text-sm font-medium">{t('sections.video.fullColorLabel')}</label>

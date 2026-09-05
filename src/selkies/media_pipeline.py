@@ -55,7 +55,7 @@ from enum import Enum
 from abc import ABCMeta, abstractmethod
 from typing import Any, Callable, Optional, Tuple
 
-from .settings import settings as app_settings
+from .settings import codec_for_encoder, settings as app_settings
 from .audio_control import AudioControl
 from .display_utils import (
     apply_common_capture_settings,
@@ -351,9 +351,8 @@ class MediaPipelinePixel(MediaPipeline):
         await self.restart_screen_capture()
 
     async def set_encoder(self, encoder: str) -> None:
-        """Switch the WebRTC video encoder (h264enc is the only one it can
-        stream). Structural (a different encoder instance), so restart capture —
-        same as use_cpu (WS parity)."""
+        """Switch the WebRTC video encoder. Structural (a different encoder
+        instance), so restart capture — same as use_cpu (WS parity)."""
         if self.encoder == encoder:
             return
         self.encoder = encoder
@@ -493,7 +492,7 @@ class MediaPipelinePixel(MediaPipeline):
             cs.capture_x = 0
             cs.capture_y = 0
             cs.auto_adjust_screen_capture_size = True
-        cs.output_mode = 1
+        cs.codec = codec_for_encoder(self.encoder)
         self._omit_stripe_headers = True
         cs.omit_stripe_headers = self._omit_stripe_headers
         apply_common_capture_settings(

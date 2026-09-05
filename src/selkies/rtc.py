@@ -62,7 +62,7 @@ try:
 except (ImportError, RuntimeError):
     pcmflux = None
 
-from .settings import settings as app_settings, inflate_gz_bounded, pipeline_starts_on, software_h264_encoder, software_h264_path
+from .settings import settings as app_settings, inflate_gz_bounded, pipeline_starts_on, software_h264_encoder, software_video_path
 from .ice import TcpMux, UdpMux
 from .ice.ice import get_host_addresses
 from .webcam import CODEC_BY_NAME, get_shared_webcam, webcam_locked_off, webcam_uplink_allowed
@@ -356,6 +356,9 @@ class RTCApp:
         get_fullcolor_for_display: Whether a display emits 4:4:4, resolved at
             offer time because the advertised profile must describe the
             bitstream the display produces now, not the startup setting.
+        on_video_codec_declined: Async hook `(display_id, mime, fallback_encoder)`
+            called when a peer's answer left out the display's codec; returns
+            whether the display moved to the fallback encoder.
         get_use_cpu_for_display: Whether a display forces software encoding,
             resolved at offer time like the encoder; with it decides whether a
             4:4:4 profile may be advertised.
@@ -409,6 +412,7 @@ class RTCApp:
         self.get_encoder_for_display = lambda display_id: self.encoder
         self.get_fullcolor_for_display = lambda display_id: bool(app_settings.video_fullcolor[0])
         self.get_use_cpu_for_display = lambda display_id: bool(app_settings.use_cpu[0])
+        self.on_video_codec_declined = None
 
         self.on_data_open = lambda channel=None: logger.warning('unhandled on_data_open')
         self.on_data_close = lambda: logger.warning('unhandled on_data_close')
@@ -463,6 +467,7 @@ class RTCApp:
 
         desc = RTCSessionDescription(sdp=sdp, type=sdp_type)
         await peer_conn.setRemoteDescription(desc)
+        await self._settle_video_codec(client_peer_id, peer_obj)
 
     async def set_ice(self, ice: Dict, client_peer_id: str) -> None:
         """Add an ICE candidate received from the signaling server.
@@ -924,7 +929,7 @@ class RTCApp:
             fullcolor = bool(app_settings.video_fullcolor[0])
         if use_cpu is None:
             use_cpu = bool(app_settings.use_cpu[0])
-        software_path = software_h264_path(
+        software_path = software_video_path(
             encoder, use_cpu or str(getattr(app_settings, "gpu_id", "")).strip() == "-1")
         sdp_text = sdp
         if 'rtx-time' not in sdp_text:
@@ -1244,19 +1249,24 @@ class RTCApp:
         )
         return config
 
-    def force_codec(self, pc: RTCPeerConnection, sender: RTCRtpSender,
-                    forced_codec_mime: str) -> None:
-        """Restrict a sender's codec preferences to one MIME type plus RTX.
+    def prefer_codec(self, pc: RTCPeerConnection, sender: RTCRtpSender,
+                     preferred_mime: str) -> None:
+        """Order a sender's codec preferences: one MIME type first, H.264 behind
+        it, then every other video codec, RTX.
 
         Every codec matching the MIME type stays eligible — H.264 appears once
-        per advertised profile. FlexFEC rides along when the receiver supports
-        it (Chrome family); a receiver without it answers without the codec and
-        the sender emits no repair stream.
+        per advertised profile. H.264 follows any other codec so a browser
+        that declines the codec answers with H.264 rather than nothing
+        (`_settle_video_codec` reads which one it took), and the rest are
+        negotiated so a live encoder switch (`switch_display_codec`) changes
+        the payload type without renegotiating. FlexFEC rides along when the
+        receiver supports it (Chrome family); a receiver without it answers
+        without the codec and the sender emits no repair stream.
 
         Args:
             pc: Peer connection owning the sender's transceiver.
-            sender: RTP sender whose transceiver is being restricted.
-            forced_codec_mime: MIME type (e.g. "video/H264") to force.
+            sender: RTP sender whose transceiver is being ordered.
+            preferred_mime: MIME type (e.g. "video/VP9") to put first.
 
         Raises:
             ValueError: When the codec or its RTX companion is not in the
@@ -1268,11 +1278,20 @@ class RTCApp:
 
         chosen_codec = []
         for codec in capabilities.codecs:
-            if codec.mimeType == forced_codec_mime:
+            if codec.mimeType == preferred_mime:
                 chosen_codec.append(codec)
 
         if not chosen_codec:
-            raise ValueError(f"Codec {forced_codec_mime} not found in capabilities")
+            raise ValueError(f"Codec {preferred_mime} not found in capabilities")
+        # H.264 right behind the preferred codec, then every other video codec,
+        # so a declined codec lands on H.264 and a later encoder switch finds
+        # its codec already negotiated.
+        for mime in ["video/H264"] + sorted({c.mimeType for c in capabilities.codecs
+                                             if c.mimeType.startswith("video/")}):
+            if mime in (preferred_mime, "video/rtx", "video/flexfec-03"):
+                continue
+            chosen_codec += [c for c in capabilities.codecs
+                             if c.mimeType == mime and c not in chosen_codec]
 
         rtx_codec = None
         for codec in capabilities.codecs:
@@ -1296,8 +1315,68 @@ class RTCApp:
             preferences.append(flexfec_codec)
 
         transceiver = next(t for t in pc.getTransceivers() if t.sender == sender)
-        logger.debug(f"Forcing codec preferences to: {preferences}")
+        logger.debug(f"Codec preferences: {preferences}")
         transceiver.setCodecPreferences(preferences)
+
+    def switch_display_codec(self, display_id: str, encoder: str) -> None:
+        """Move every peer of a display to the codec its new encoder streams.
+
+        A peer whose answer took the codec sends it from the capture's next
+        frame under its own payload type; one that did not is told, and its
+        video pauses until an encoder it took is chosen. A peer still
+        negotiating settles at its answer.
+        """
+        mime = self.get_mime_by_encoder(encoder)
+        for peer_id, peer in list(self.peer_connections.items()):
+            if (peer.get("display_id") or "primary") != display_id:
+                continue
+            sender = peer.get("video_sender")
+            if sender is None:
+                continue
+            peer["video_mime"] = mime
+            if sender.switch_codec(mime):
+                logger.info(f"Video for peer {peer_id} on display '{display_id}' switched to {mime}")
+            else:
+                logger.error(f"Peer {peer_id} did not negotiate {mime}: its video pauses "
+                             f"until display '{display_id}' runs an encoder it takes.")
+
+    async def _settle_video_codec(self, client_peer_id: str, peer_obj: Dict[str, Any]) -> None:
+        """Take the video codec a peer's answer settled on.
+
+        The offer put the display's codec first and H.264 behind it, so a
+        browser that declines the codec answers with H.264. The display then
+        moves to `h264enc` through `on_video_codec_declined`; a display whose
+        encoder the operator holds stops sending video to this peer instead,
+        since one codec's bitstream must never be packed as another's.
+        """
+        sender = peer_obj.get("video_sender")
+        wanted = peer_obj.get("video_mime")
+        if sender is None or wanted is None:
+            return
+        transceiver = next(
+            (t for t in peer_obj["peer_conn"].getTransceivers() if t.sender is sender), None)
+        if transceiver is None:
+            return
+        negotiated = next(
+            (c for c in transceiver._codecs
+             if not c.mimeType.lower().endswith(("/rtx", "/flexfec-03"))), None)
+        if negotiated is None:
+            return
+        display_id = peer_obj.get("display_id") or "primary"
+        logger.info(f"Video for peer {client_peer_id} on display '{display_id}' "
+                    f"negotiated {negotiated.mimeType}")
+        if negotiated.mimeType.lower() == wanted.lower():
+            return
+        moved = False
+        if self.on_video_codec_declined is not None:
+            try:
+                moved = bool(await self.on_video_codec_declined(display_id, wanted, "h264enc"))
+            except Exception:
+                logger.warning("on_video_codec_declined failed", exc_info=True)
+        if not moved:
+            logger.error(f"Peer {client_peer_id} declined {wanted} and the encoder of "
+                         f"display '{display_id}' is held: its video stays off for this peer.")
+            sender._enabled = False
 
     async def _drain_channel_queue(self, queue: asyncio.Queue,
                                    handler: Callable[[Any], Any],
@@ -1794,7 +1873,7 @@ class RTCApp:
             preferred_codec = self.get_mime_by_encoder(display_encoder)
             if preferred_codec is None:
                 raise RTCAppError(f"Encoder {display_encoder} is not supported")
-            self.force_codec(peer_connection, rtp_video_sender, preferred_codec)
+            self.prefer_codec(peer_connection, rtp_video_sender, preferred_codec)
 
             await peer_connection.setLocalDescription(await peer_connection.createOffer())
             offer = peer_connection.localDescription
@@ -1826,6 +1905,7 @@ class RTCApp:
             "mic_state": mic_state,
             "webcam_state": webcam_state,
             "video_sender": rtp_video_sender,
+            "video_mime": preferred_codec,
             "video_paused": video_paused,
             "audio_sender": rtp_audio_sender,
             "audio_paused": audio_paused,
@@ -1948,8 +2028,8 @@ class RTCApp:
         virtual webcam.
 
         The browser encodes its camera with its own WebRTC encoder (hardware
-        where it has one) and the depacketized frames — Annex-B H.264, VP8 or
-        VP9 — go straight to pixelflux, which decodes them off the GIL; no
+        where it has one) and the depacketized frames — Annex-B H.264 or
+        H.265, VP8 or VP9 — go straight to pixelflux, which decodes them off the GIL; no
         Python decode and no data-channel chunking. When the decoder asks for a
         keyframe (after a drop or a late start) the request becomes a PLI.
 
@@ -1967,7 +2047,7 @@ class RTCApp:
         cam_tx = peer_connection.addTransceiver("video", direction="recvonly")
         try:
             caps = RTCRtpSender.getCapabilities("video")
-            wanted = ("video/h264", "video/vp8", "video/vp9", "video/rtx")
+            wanted = ("video/h264", "video/vp8", "video/vp9", "video/h265", "video/rtx")
             preferred = [c for c in caps.codecs if c.mimeType.lower() in wanted]
             if preferred:
                 cam_tx.setCodecPreferences(preferred)
@@ -2044,11 +2124,10 @@ class RTCApp:
     def get_mime_by_encoder(self, encoder: str) -> Optional[str]:
         """Return the RTP MIME type for an encoder name.
 
-        Every pipeline encoder emits H.264; offering another MIME would
-        negotiate a codec the stream cannot honor, so a new entry may only be
-        added together with a real pixelflux encoder (the vendored webrtc
-        stack keeps its VP8 RTP support for that). An unmapped encoder, e.g. a
-        stale persisted client setting, must never take the transport down.
+        The full-frame encoders map to the codecs the vendored RTP stack
+        packetizes, and the published encoder menu is filtered to the same set
+        (WEBRTC_ENCODER_CHOICES). An unmapped encoder, e.g. a stale persisted
+        client setting, must never take the transport down.
 
         Returns:
             The MIME type; unmapped encoders fall back to "video/H264".
@@ -2056,6 +2135,10 @@ class RTCApp:
 
         encoder_mime_map = {
             "h264enc": "video/H264",
+            "h265enc": "video/H265",
+            "vp8enc": "video/VP8",
+            "vp9enc": "video/VP9",
+            "av1enc": "video/AV1",
         }
         mime = encoder_mime_map.get(encoder)
         if mime is None:

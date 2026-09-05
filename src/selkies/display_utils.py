@@ -2588,7 +2588,7 @@ def apply_common_capture_settings(
     cs.video_paintover_burst_frames = paintover_burst
     cs.video_fullcolor = fullcolor
     cs.video_streaming_mode = streaming
-    cs.video_fullframe = encoder == "h264enc"
+    cs.video_fullframe = encoder != "h264enc-striped"
     cs.video_cbr_mode = cbr
     cs.video_bitrate_kbps = int(round(float(bitrate_kbps)))
     # 0 = infinite GOP (on-demand keyframes only).
@@ -2598,9 +2598,11 @@ def apply_common_capture_settings(
     cs.video_max_qp = int(getattr(server, "video_max_qp", 0) or 0)
     cs.use_cpu = bool(use_cpu)
     if cs.use_cpu and encoder != "jpeg":
-        from .settings import software_h264_encoder
+        from .settings import CODEC_LABELS, codec_for_encoder, software_encoders
+        codec = codec_for_encoder(encoder)
+        library = software_encoders().get(codec, "no software encoder in this pixelflux build")
         logging.getLogger("display_utils").info(
-            f"Display '{display_name}' encodes H.264 in software ({software_h264_encoder()}).")
+            f"Display '{display_name}' encodes {CODEC_LABELS.get(codec, codec)} in software ({library}).")
 
     cs.use_paint_over_quality = use_paint_over_quality
     cs.paint_over_trigger_frames = 15

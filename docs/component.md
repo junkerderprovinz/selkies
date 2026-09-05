@@ -53,7 +53,7 @@ The term `client` refers to the [web components](https://github.com/selkies-proj
 
 The web client is a WebCodecs-based HTML5 application (with the core `selkies-core.js`, the WebSocket transport core `selkies-ws-core.js`, the WebRTC transport core `selkies-wr-core.js`, and the input library `lib/input.js`). It is responsible for the web browser interface that you see when you use Selkies.
 
-It decodes the incoming H.264 stream using the browser [WebCodecs](https://developer.mozilla.org/en-US/docs/Web/API/WebCodecs_API) API with a low-latency zero-copy rendering path (a browser without WebCodecs is served the striped JPEG stream instead, painted through `createImageBitmap`), plays Opus audio, and detects keyboard, mouse, gamepad, and clipboard input from the user, then sends them to the host server backend. It also handles remote cursors with the Pointer Lock API so that you can correctly control interactive applications and games.
+It decodes the incoming video stream (H.264, H.265, VP8, VP9 or AV1, whichever the server encodes, read from the frame's own wire header) using the browser [WebCodecs](https://developer.mozilla.org/en-US/docs/Web/API/WebCodecs_API) API with a low-latency zero-copy rendering path (a codec the browser's decoder refuses falls back to H.264, and a browser without WebCodecs is served the striped JPEG stream instead, painted through `createImageBitmap`), plays Opus audio, and detects keyboard, mouse, gamepad, and clipboard input from the user, then sends them to the host server backend. It also handles remote cursors with the Pointer Lock API so that you can correctly control interactive applications and games.
 
 The web client source lives at [`addons/selkies-web-core`](https://github.com/selkies-project/selkies/tree/main/addons/selkies-web-core) and is built and bundled into the Python wheel automatically (installed at `src/selkies/selkies_web`), so **there is no separate web package to download or install**. A source checkout builds that bundle with `scripts/ci/build-web.sh` (requires `npm`), the one script the wheel build, the conda recipe, the root `Dockerfile`, and the devcontainer all run, so every channel ships the same files. To serve your own copy of the web files, point `--web-root=` (or the `SELKIES_WEB_ROOT` environment variable) at a built web directory containing an `index.html`. Rebranding (name, icons, manifest) is done at build time in the `addons/selkies-web-core` source tree, not by editing the shipped artifacts.
 
@@ -67,7 +67,7 @@ Audio capture and encoding are performed by [`pcmflux`](https://github.com/selki
 
 Both are pulled in automatically as dependencies of the `selkies` wheel, so you normally do not install them separately. Their Rust references are published at <https://pixelflux.selkies.io> and <https://pcmflux.selkies.io>.
 
-**Licensing note (GPL toggle):** the software H.264 encoder of `pixelflux` is chosen when `pixelflux` is built, never by a Selkies setting: the default build uses GPL-2.0+ `libx264` (with an install-time notice), and a build made with `PIXELFLUX_ENABLE_GPL=0` excludes every GPL-licensed component and uses the BSD-licensed OpenH264 instead, behind the same `h264enc` / `h264enc-striped` encoders. Selkies reads `pixelflux.SOFTWARE_H264_ENCODER` to name the encoder in its logs and to default a session known to run on OpenH264 to CBR rate control (OpenH264 targets a bandwidth rather than a quality level); OpenH264 encodes 4:2:0 only, so `--video-fullcolor` has no effect on its software path. [Licensing](licensing.md) lists every third-party component of an installation with its license and where the GPL pieces come from.
+**Licensing note (GPL toggle):** the software encoders of `pixelflux` are chosen when `pixelflux` is built, never by a Selkies setting: the default build uses GPL-2.0+ `libx264` and x265 (with an install-time notice), and a build made with `PIXELFLUX_ENABLE_GPL=0` excludes every GPL-licensed component and uses the BSD-licensed OpenH264 and kvazaar instead, behind the same `h264enc` / `h264enc-striped` / `h265enc` encoders; VP8, VP9 (libvpx) and AV1 (SVT-AV1) are BSD-licensed in every build. Selkies reads `pixelflux.SOFTWARE_ENCODERS` to name the encoders in its logs and to default a session known to run on OpenH264 to CBR rate control (OpenH264 targets a bandwidth rather than a quality level); OpenH264 and kvazaar encode 4:2:0 only, so `--video-fullcolor` has no effect on their software paths. [Licensing](licensing.md) lists every third-party component of an installation with its license and where the GPL pieces come from.
 
 ### Optional Components
 
@@ -326,17 +326,14 @@ Video is encoded by the `pixelflux` extension.
 | Encoder (`--encoder=`) | Codec | Acceleration | Notes |
 |---|---|---|---|
 | `h264enc` (default) | H.264 AVC | NVIDIA NVENC / Intel & AMD VA-API, software fallback (`x264`, or OpenH264 in a GPL-free `pixelflux`) | Uses hardware encoding when a supported GPU is available; add `--use-cpu=true` to force software |
+| `h265enc` | H.265 HEVC | NVIDIA NVENC / Intel & AMD VA-API, software fallback (`x265`, or kvazaar in a GPL-free `pixelflux`) | Carries 4:4:4 like H.264; a browser without an HEVC decoder falls back to `h264enc` |
+| `vp8enc` | VP8 | Intel & AMD VA-API, software fallback (libvpx) | Decodes everywhere |
+| `vp9enc` | VP9 | Intel & AMD VA-API, software fallback (libvpx) | |
+| `av1enc` | AV1 | NVIDIA NVENC (Ada and newer) / Intel & AMD VA-API, software fallback (SVT-AV1) | Best quality per bit at low bitrates |
 | `h264enc-striped` | H.264 AVC | Software (`x264`, or OpenH264 in a GPL-free `pixelflux`) | Striped/parallel software H.264 |
 | `jpeg` | Motion JPEG | Software | Maximum-compatibility fallback |
 
-**WebRTC mode (`--mode=webrtc`)** — the same `SELKIES_ENCODER` / `--encoder=` knob drives both transports. WebRTC can produce only full-frame H.264, so in this mode the published menu is filtered to the encoder below and a websockets-only choice (`h264enc-striped`, `jpeg`) falls back to the default with a logged warning; switching back to WebSockets restores the configured menu and value:
-
-| Encoder (`--encoder=`) | Codec | Acceleration | Browsers |
-|---|---|---|---|
-| `h264enc` (default) | H.264 AVC | Hardware-first (NVENC/VA-API), else the software encoder `pixelflux` was built with (`x264`, or OpenH264 in a GPL-free build) | All major |
-
-Additional codecs (H.265/HEVC, AV1, VP8/VP9) are planned for `pixelflux` in the mid-term
-future; the vendored WebRTC stack already carries the RTP-side code for them.
+**WebRTC mode (`--mode=webrtc`)** — the same `SELKIES_ENCODER` / `--encoder=` knob drives both transports. WebRTC carries the full-frame encoders (`h264enc`, `h265enc`, `vp8enc`, `vp9enc`, `av1enc`), packetized by the vendored RTP stack (RFC 6184, RFC 7798, RFC 7741, RFC 9628 and the AV1 RTP payload format); the striped framings of `h264enc-striped` and `jpeg` are WebSocket-only, so in this mode the published menu is filtered to the five and either of those two falls back to the default with a logged warning; switching back to WebSockets restores the configured menu and value. The offer puts the display's codec first, H.264 behind it and every other codec after that: a browser that declines the codec answers with H.264 and the display moves to `h264enc` for every viewer, logged as a warning, unless the operator's menu holds the encoder, in which case that peer gets no video rather than another codec's bitstream; a live encoder change switches each peer's payload type to the codec it already negotiated, with no renegotiation. Which codecs a browser takes over WebRTC is the browser's own RTP receiver's business (its `RTCRtpReceiver.getCapabilities`, which the dashboards filter the menu by), not WebCodecs': Chromium and Firefox take VP8, VP9 and AV1 everywhere and H.265 only where the platform decodes it, Safari takes H.265 as well.
 
 ### Display Capture
 

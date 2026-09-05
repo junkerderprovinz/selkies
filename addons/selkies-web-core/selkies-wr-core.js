@@ -1830,7 +1830,7 @@ export default function webrtc() {
 			crf = parseInt(settings.video_crf, 10);
 			webrtc.sendDataChannelMessage(`_crf,${crf}`);
 			storeInt('video_crf', crf);
-			console.log(`H264 CRF set to ${crf}`);
+			console.log(`Video CRF set to ${crf}`);
 		}
 		if (settings.force_aligned_resolution !== undefined) {
 			force_aligned_resolution = !!settings.force_aligned_resolution;

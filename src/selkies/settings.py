@@ -224,7 +224,7 @@ SETTING_DEFINITIONS: List[Dict[str, Any]] = [
         # "cbr" first is dropdown order only: the default stays "crf" and
         # allowed[0] is never a fallback here (clients only send crf/cbr).
         "meta": {"allowed": ["cbr", "crf"]},
-        "help": "Rate control mode for the H.264 encoders (crf = constant quality/QP, cbr = constant bitrate). Honored for every H.264 encoder when enable_rate_control is true (the default).",
+        "help": "Rate control mode for the video encoders (crf = constant quality/QP, cbr = constant bitrate). Honored for every video encoder when enable_rate_control is true (the default).",
     },
     {
         "name": "enable_rate_control",
@@ -246,7 +246,7 @@ SETTING_DEFINITIONS: List[Dict[str, Any]] = [
         "default": 0,
         "min": 0,
         "max": 51,
-        "help": "CBR-mode minimum H.264 QP (0 = encoder default). Raising it caps bit spend on easy content when the bitrate budget is generous.",
+        "help": "CBR-mode minimum quantizer on the H.264 QP scale, mapped onto each codec's own quantizer range (0 = encoder default). Raising it caps bit spend on easy content when the bitrate budget is generous.",
     },
     {
         "name": "video_max_qp",
@@ -254,7 +254,7 @@ SETTING_DEFINITIONS: List[Dict[str, Any]] = [
         "default": 0,
         "min": 0,
         "max": 51,
-        "help": "CBR-mode maximum H.264 QP (0 = encoder default). Lowering it keeps screen text legible under motion at the cost of overshooting the bitrate target on hard content (measured at 720p60 scrolling text: 35 lifts x264 by ~19 dB at ~2.5x the target).",
+        "help": "CBR-mode maximum quantizer on the H.264 QP scale, mapped onto each codec's own quantizer range (0 = encoder default). Lowering it keeps screen text legible under motion at the cost of overshooting the bitrate target on hard content (measured at 720p60 scrolling text: 35 lifts x264 by ~19 dB at ~2.5x the target).",
     },
     {
         "name": "audio_frame_duration_ms",
@@ -605,8 +605,8 @@ SETTING_DEFINITIONS: List[Dict[str, Any]] = [
         "name": "encoder",
         "type": "enum",
         "default": "h264enc",
-        "meta": {"allowed": ["h264enc", "h264enc-striped", "jpeg"]},
-        "help": "The default video encoder: h264enc is full-frame H.264 on NVENC or VA-API, falling back to the software encoder pixelflux was built with (x264, or OpenH264 in a GPL-free build); h264enc-striped is CPU-striped H.264 on that same software encoder; jpeg is CPU-striped JPEG. Only h264enc streams over WebRTC.",
+        "meta": {"allowed": ["h264enc", "h265enc", "vp8enc", "vp9enc", "av1enc", "h264enc-striped", "jpeg"]},
+        "help": "The default video encoder. Every full-frame encoder runs on NVENC or VA-API where the GPU carries the codec and falls back to the software encoder pixelflux was built with: h264enc (x264, or OpenH264 in a GPL-free build), h265enc (x265, or kvazaar in a GPL-free build), vp8enc and vp9enc (libvpx), av1enc (SVT-AV1). h264enc-striped is CPU-striped H.264, jpeg is CPU-striped JPEG. A client whose browser cannot decode the codec falls back to h264enc, then jpeg. The WebRTC transport carries the full-frame encoders and a browser that declines the codec is answered with h264enc; h264enc-striped and jpeg are WebSocket-only.",
     },
     {
         "name": "jpeg_quality",
@@ -619,13 +619,13 @@ SETTING_DEFINITIONS: List[Dict[str, Any]] = [
         "name": "video_fullcolor",
         "type": "bool",
         "default": False,
-        "help": "Encode H.264 with 4:4:4 chroma rather than 4:2:0, for pixelflux encoders. A client whose decoder has no 4:4:4 profile turns it off for itself; where it is locked on, such a client falls back to the JPEG encoder.",
+        "help": "Encode with 4:4:4 chroma rather than 4:2:0 where the codec and encoder carry it (H.264 and H.265 on NVENC, VA-API, x264 and x265); other codecs and encoders stay 4:2:0. A client whose decoder has no 4:4:4 profile turns it off for itself; where it is locked on, such a client falls back to the JPEG encoder.",
     },
     {
         "name": "video_streaming_mode",
         "type": "bool",
         "default": True,
-        "help": "Enable H.264 streaming mode (Turbo: encode every frame like a traditional video encoder) for pixelflux encoders.",
+        "help": "Enable video streaming mode (Turbo: encode every frame like a traditional video encoder) for pixelflux encoders.",
     },
     {
         "name": "use_cpu",
@@ -1087,14 +1087,35 @@ def parse_bool(value: Any, default: bool = False) -> bool:
     return text.split("|")[0].strip().lower() in ("true", "1")
 
 
-# Encoders the WebRTC pipeline can produce: pixelflux emits H.264 only, and
-# the jpeg/striped framing is a websockets-stream concept.
-WEBRTC_ENCODER_CHOICES = ("h264enc",)
+# Encoders the WebRTC pipeline can produce: the full-frame codecs its RTP stack
+# packetizes. The jpeg/striped framing is a websockets-stream concept.
+WEBRTC_ENCODER_CHOICES = ("h264enc", "h265enc", "vp8enc", "vp9enc", "av1enc")
 
 # Spellings base images still ship in SELKIES_ENCODER; both mean full-frame
 # H.264 (the software encoder is the pixelflux build's, software_h264_encoder).
 ENCODER_ALIASES = {"x264enc": "h264enc", "openh264enc": "h264enc"}
 _ALIAS_WARNED = set()
+
+# The pixelflux codec each encoder name selects.
+ENCODER_CODECS = {
+    "jpeg": "jpeg",
+    "h264enc": "h264",
+    "h264enc-striped": "h264",
+    "h265enc": "h265",
+    "vp8enc": "vp8",
+    "vp9enc": "vp9",
+    "av1enc": "av1",
+}
+
+# The name each pixelflux codec goes by in logs and notices.
+CODEC_LABELS = {"jpeg": "JPEG", "h264": "H.264", "h265": "H.265", "vp8": "VP8", "vp9": "VP9", "av1": "AV1"}
+
+
+def codec_for_encoder(encoder: str) -> str:
+    """The pixelflux codec name an encoder selects; an unknown name selects H.264,
+    the codec every path serves, so a stale persisted client value never takes a
+    capture down."""
+    return ENCODER_CODECS.get(canonical_encoder(encoder), "h264")
 
 
 def canonical_encoder(name: Any) -> str:
@@ -1117,28 +1138,38 @@ def canonical_encoder(name: Any) -> str:
     return ENCODER_ALIASES.get(key, text)
 
 
-def software_h264_encoder() -> str:
-    """The software H.264 encoder of the installed pixelflux build, "x264" or "openh264".
-
-    Read from pixelflux.SOFTWARE_H264_ENCODER, which a build sets from its
-    features (libx264 by default, OpenH264 for a GPL-free build). Rendering the
-    settings reference needs no extension, and reads as the default x264 build.
+def software_encoders() -> Dict[str, str]:
+    """The software encoder of each codec the installed pixelflux build carries, by
+    codec name: H.264 by the build's feature choice ("x264" or "openh264"), the
+    others by what the FFmpeg it links carries ("x265" or "kvazaar", "libvpx",
+    "svt-av1"). A codec without an entry has no software path in that build.
+    Rendering the settings reference needs no extension, and reads as the
+    default x264 build.
     """
     try:
         import pixelflux
     except ImportError:
-        return "x264"
-    return str(pixelflux.SOFTWARE_H264_ENCODER)
+        return {"h264": "x264"}
+    return {str(k): str(v) for k, v in dict(pixelflux.SOFTWARE_ENCODERS).items()}
 
 
-def software_h264_path(encoder: str, use_cpu: bool) -> bool:
-    """Whether a session with this encoder is known to encode H.264 on the CPU.
+def software_h264_encoder() -> str:
+    """The software H.264 encoder of the installed pixelflux build, "x264" or "openh264"."""
+    return software_encoders().get("h264", "x264")
 
-    The striped encoder has no hardware path; h264enc encodes in software when
-    software encoding is forced. h264enc without that may still land on the CPU
-    (no usable GPU), which nothing here can know in advance.
+
+def software_video_path(encoder: str, use_cpu: bool) -> bool:
+    """Whether a session with this encoder is known to encode video on the CPU.
+
+    The striped encoder has no hardware path; a full-frame encoder encodes in
+    software when software encoding is forced. Without that it may still land
+    on the CPU (no usable GPU, or a codec the GPU lacks), which nothing here can
+    know in advance.
     """
-    return encoder == "h264enc-striped" or (encoder == "h264enc" and bool(use_cpu))
+    encoder = canonical_encoder(encoder)
+    if encoder == "jpeg":
+        return False
+    return encoder == "h264enc-striped" or bool(use_cpu)
 
 
 
@@ -1501,6 +1532,10 @@ class AppSettings:
 
     ENCODER_RC_DEFAULTS = {
         "h264enc": "crf",
+        "h265enc": "crf",
+        "vp8enc": "crf",
+        "vp9enc": "crf",
+        "av1enc": "crf",
         "h264enc-striped": "crf",
         "jpeg": "crf",
     }
@@ -1510,7 +1545,7 @@ class AppSettings:
         H.264 path: the striped encoder, or h264enc with software encoding
         forced by use_cpu or gpu_id=-1."""
         forced = bool(self.use_cpu[0]) or str(self.gpu_id).strip() == "-1"
-        return software_h264_path(self.encoder, forced)
+        return codec_for_encoder(self.encoder) == "h264" and software_video_path(self.encoder, forced)
 
     def resolve_rate_control_default(self) -> None:
         """Apply the transport's rate-control default for the current mode.
@@ -1813,9 +1848,9 @@ def build_client_settings_payload() -> Dict[str, Dict[str, Any]]:
     default; the client uses it to decide whether a conditional default (HiDPI
     off under a manual resolution, say) applies or defers to the operator.
     Adds the clipboard gate booleans derived from the single
-    `enable_clipboard` policy and the pixelflux build's
-    `software_h264_encoder` ("x264" or "openh264"), which the dashboards'
-    rate-control default reads.
+    `enable_clipboard` policy and the pixelflux build's `software_encoders`
+    (the software encoder behind each codec, "x264" or "openh264" for H.264),
+    which the dashboards' rate-control default reads.
     """
     out = {}
     for setting_def in SETTING_DEFINITIONS:
@@ -1847,7 +1882,7 @@ def build_client_settings_payload() -> Dict[str, Dict[str, Any]]:
     out['clipboard_enabled'] = {'value': clip != 'false'}
     out['clipboard_in_enabled'] = {'value': clip in ('true', 'in')}
     out['clipboard_out_enabled'] = {'value': clip in ('true', 'out')}
-    out['software_h264_encoder'] = {'value': software_h264_encoder()}
+    out['software_encoders'] = {'value': software_encoders()}
     return out
 
 
