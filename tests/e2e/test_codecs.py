@@ -32,7 +32,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import helpers as H
 import core_lib as C
-import test_encoders as TE
+import test_encoders as TENC
 from playwright.sync_api import sync_playwright
 
 CODECS = [("h265enc", "H265", "hev1.1.6.L93.B0", "video/H265"),
@@ -60,10 +60,10 @@ RTP_PROBE_JS = """(mime) => {
 def wait_stream_mode(mode_name: str, timeout: float = 15) -> str:
     """The server's latest stream line once it names `mode_name`, else the last one seen."""
     deadline = time.time() + timeout
-    line = TE.last_stream_line()
+    line = TENC.last_stream_line()
     while time.time() < deadline and f"Mode: {mode_name}" not in line:
         time.sleep(0.5)
-        line = TE.last_stream_line()
+        line = TENC.last_stream_line()
     return line
 
 
@@ -106,7 +106,7 @@ def block_codec(mode: str, wayland: bool, engine: str, encoder: str, mode_name: 
     # The codec under test is the default; the ladder's rungs stay allowed.
     H.server_start(mode=mode, wayland=wayland,
                    extra_env={"SELKIES_ENCODER": f"{encoder},h264enc,jpeg"})
-    picture = TE.Picture(wayland)
+    picture = TENC.Picture(wayland)
     try:
         picture.paint()
         with sync_playwright() as p:
@@ -123,23 +123,23 @@ def block_codec(mode: str, wayland: bool, engine: str, encoder: str, mode_name: 
                                   C.wait_log(f"negotiated {rtp_mime}", timeout=10), "")
                         line = wait_stream_mode(mode_name)
                         res.check(f"{tag}: the server streams {mode_name}",
-                                  f"Mode: {mode_name}" in line, TE.encoder_field(line))
+                                  f"Mode: {mode_name}" in line, TENC.encoder_field(line))
                     else:
                         res.check(f"{tag}: the browser declined it, so the display moved to h264enc",
                                   C.wait_log("is not decoded by a WebRTC peer", timeout=10)
                                   and C.wait_log("using 'h264enc'", timeout=10), "")
                         line = wait_stream_mode("H264")
                         res.check(f"{tag}: the server streams H.264 instead",
-                                  "Mode: H264" in line, TE.encoder_field(line))
+                                  "Mode: H264" in line, TENC.encoder_field(line))
                     sample = picture.wait(page)
                     res.check(f"{tag}: the painted picture decodes", picture.matches(sample), sample)
-                    print(f"      {tag}: rtp={'yes' if taken else 'no'} {TE.encoder_field(line)}")
+                    print(f"      {tag}: rtp={'yes' if taken else 'no'} {TENC.encoder_field(line)}")
                     return
                 supported = page.evaluate(PROBE_JS, probe)
                 video = C.wait_ws_video(page, timeout=30)
                 res.check(f"{tag}: stream up", bool(video), video)
                 settled = wait_settled_encoder(page)
-                line = TE.last_stream_line()
+                line = TENC.last_stream_line()
                 refused_at_decode = any("refused at decode" in t for t in said)
                 if refused_at_decode:
                     supported = False
@@ -147,12 +147,12 @@ def block_codec(mode: str, wayland: bool, engine: str, encoder: str, mode_name: 
                     res.check(f"{tag}: the engine decodes it, so the codec is kept",
                               settled == encoder, f"page encoder {settled}")
                     res.check(f"{tag}: the server streams {mode_name}",
-                              f"Mode: {mode_name}" in line, TE.encoder_field(line))
+                              f"Mode: {mode_name}" in line, TENC.encoder_field(line))
                 else:
                     res.check(f"{tag}: the engine refuses it, so the ladder steps to h264enc",
                               settled in ("h264enc", "jpeg"), f"page encoder {settled}")
                     res.check(f"{tag}: the server followed the fallback",
-                              "Mode: H264" in line or "Mode: JPEG" in line, TE.encoder_field(line))
+                              "Mode: H264" in line or "Mode: JPEG" in line, TENC.encoder_field(line))
                 fps = 0
                 for _ in range(20):
                     fps = page.evaluate("window.fps || 0")
@@ -163,7 +163,7 @@ def block_codec(mode: str, wayland: bool, engine: str, encoder: str, mode_name: 
                 sample = picture.wait(page)
                 res.check(f"{tag}: the painted picture decodes", picture.matches(sample), sample)
                 print(f"      {tag}: probe={'refused at decode' if refused_at_decode else ('yes' if supported else 'no')}"
-                      f" settled={settled} {TE.encoder_field(line)}")
+                      f" settled={settled} {TENC.encoder_field(line)}")
             finally:
                 owner.close()
     finally:

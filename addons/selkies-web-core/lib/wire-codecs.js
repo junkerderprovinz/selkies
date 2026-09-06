@@ -87,7 +87,7 @@ export const annexbNals = (bytes) => {
  * @param {Uint8Array} bytes
  * @param {number} offset
  * @param {number} limit
- * @returns {{u: (n: number) => number, ue: () => number, skip: (n: number) => void}}
+ * @returns {{u: (n: number) => number, skip: (n: number) => void}}
  */
 export const rbspReader = (bytes, offset, limit) => {
   const data = [];
@@ -109,12 +109,7 @@ export const rbspReader = (bytes, offset, limit) => {
     }
     return v;
   };
-  const ue = () => {
-    let leading = 0;
-    while (u(1) === 0 && leading < 32) leading++;
-    return (2 ** leading) - 1 + u(leading);
-  };
-  return { u, ue, skip: (n) => { pos += n; } };
+  return { u, skip: (n) => { pos += n; } };
 };
 
 /**
