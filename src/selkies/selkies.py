@@ -252,25 +252,24 @@ try:
     import pixelflux
     from pixelflux import CaptureSettings, ScreenCapture
 
-    # The codec API this tree drives; an older build would fail on every
-    # capture start and client connect instead of once, here.
+    # One check for the build Selkies pins, at import: a pixelflux without
+    # this surface would fail on every capture start and client connect.
     if not hasattr(pixelflux, "SOFTWARE_ENCODERS") or not hasattr(CaptureSettings(), "codec"):
         try:
             installed = importlib.metadata.version("pixelflux")
         except Exception:
             installed = "unknown version"
-        raise RuntimeError(
-            f"pixelflux {installed} predates the codec API (SOFTWARE_ENCODERS, "
-            "CaptureSettings.codec) this Selkies is built against; install the "
-            "pixelflux release Selkies pins")
+        raise SystemExit(
+            f"pixelflux {installed} is not the release Selkies pins: it has no "
+            "SOFTWARE_ENCODERS or CaptureSettings.codec. Install the pinned pixelflux.")
     X11_CAPTURE_AVAILABLE = True
     data_logger.info("pixelflux library found. Striped encoding modes available.")
 except (ImportError, RuntimeError) as e:
     # RuntimeError is pixelflux ABI/version skew: degrade instead of crashing at startup.
     ScreenCapture = CaptureSettings = None
     X11_CAPTURE_AVAILABLE = False
-    data_logger.error(
-        f"pixelflux library unavailable ({e}). Video capture is unavailable."
+    data_logger.warning(
+        f"pixelflux library unavailable ({e}). Striped encoding modes unavailable."
     )
 
 upload_path: str = str(getattr(settings, 'file_manager_path', '') or '~/Desktop')

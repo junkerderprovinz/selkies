@@ -73,10 +73,9 @@ check("webrtc defaults to cbr", got == "cbr", got)
 got = probe("import importlib.util as iu"
             "; enc = __import__('pixelflux').SOFTWARE_ENCODERS['h264']"
             " if iu.find_spec('pixelflux') else 'x264'"
-            "; print(s.software_h264_encoder() == enc,"
-            " s.software_h264_encoder() in ('x264', 'openh264'),"
-            " s.software_encoders()['h264'] == s.software_h264_encoder())")
-check("software_h264_encoder() reports the installed pixelflux build", got == "True True True", got)
+            "; print(s.software_encoders()['h264'] == enc,"
+            " s.software_encoders()['h264'] in ('x264', 'openh264'))")
+check("software_encoders() reports the installed pixelflux build", got == "True True", got)
 
 # x264 is quality-driven: the software path keeps the CRF default. OpenH264
 # targets a bandwidth: a session known to be on the software path (the striped

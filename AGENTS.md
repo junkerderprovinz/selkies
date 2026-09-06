@@ -80,7 +80,7 @@ Each is documented in full where named; read that before changing the subsystem.
 - A DPI is an output scale on the session compositor, never Xft resources; only a changed capture scale restarts a
   capture (`src/selkies/display_utils.py` module docstring).
 - Software H.264 is a property of the installed pixelflux build, never a Selkies setting
-  (`settings.software_h264_encoder`, `canonical_encoder`; the OpenH264 profile gate in `src/selkies/rtc.py`).
+  (`settings.software_encoders`, `canonical_encoder`; the OpenH264 profile gate in `src/selkies/rtc.py`).
 - The sound-server control plane is in-process over pulsectl_asyncio under a never-cancel discipline; `pactl` is
   only the fallback when the bindings are missing (`src/selkies/audio_control.py` module docstring).
 - Bulk traffic sharing the session connection is paced by an end-to-end gauge, never by the local send

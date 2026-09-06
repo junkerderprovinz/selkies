@@ -62,7 +62,7 @@ try:
 except (ImportError, RuntimeError):
     pcmflux = None
 
-from .settings import settings as app_settings, inflate_gz_bounded, pipeline_starts_on, software_h264_encoder, software_video_path
+from .settings import settings as app_settings, inflate_gz_bounded, pipeline_starts_on, software_encoders, software_video_path
 from .ice import TcpMux, UdpMux
 from .ice.ice import get_host_addresses
 from .webcam import CODEC_BY_NAME, get_shared_webcam, webcam_locked_off, webcam_uplink_allowed
@@ -946,7 +946,7 @@ class RTCApp:
                 logger.warning("injecting modified sps-pps-idr-in-keyframe to SDP")
                 sdp_text = re.sub(r'sps-pps-idr-in-keyframe=\d+', r'sps-pps-idr-in-keyframe=1', sdp_text)
             if ("h264" in encoder or "x264" in encoder) and fullcolor \
-                    and not (software_path and software_h264_encoder() == "openh264"):
+                    and not (software_path and software_encoders().get("h264") == "openh264"):
                 sdp_text = re.sub(r'profile-level-id=[0-9A-Fa-f]{6}',
                                   'profile-level-id=f4001f', sdp_text)
         if "opus/" in sdp_text.lower():

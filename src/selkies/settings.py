@@ -1092,7 +1092,7 @@ def parse_bool(value: Any, default: bool = False) -> bool:
 WEBRTC_ENCODER_CHOICES = ("h264enc", "h265enc", "vp8enc", "vp9enc", "av1enc")
 
 # Spellings base images still ship in SELKIES_ENCODER; both mean full-frame
-# H.264 (the software encoder is the pixelflux build's, software_h264_encoder).
+# H.264 (the software encoder is the pixelflux build's, `software_encoders`).
 ENCODER_ALIASES = {"x264enc": "h264enc", "openh264enc": "h264enc"}
 _ALIAS_WARNED = set()
 
@@ -1133,7 +1133,7 @@ def canonical_encoder(name: Any) -> str:
         logging.warning(
             "Encoder 'openh264enc' is not a separate choice: software H.264 "
             "is the encoder pixelflux was built with (%s); using 'h264enc'.",
-            software_h264_encoder(),
+            software_encoders().get("h264", "none"),
         )
     return ENCODER_ALIASES.get(key, text)
 
@@ -1155,11 +1155,6 @@ def software_encoders() -> Dict[str, str]:
     if table is None:
         return {}
     return {str(k): str(v) for k, v in dict(table).items()}
-
-
-def software_h264_encoder() -> str:
-    """The software H.264 encoder of the installed pixelflux build, "x264" or "openh264"."""
-    return software_encoders().get("h264", "x264")
 
 
 def software_video_path(encoder: str, use_cpu: bool) -> bool:
@@ -1544,12 +1539,19 @@ class AppSettings:
         "jpeg": "crf",
     }
 
-    def on_software_h264_path(self) -> bool:
+    def on_software_video_path(self) -> bool:
         """Whether the server's own defaults put a session on the software
-        H.264 path: the striped encoder, or h264enc with software encoding
-        forced by use_cpu or gpu_id=-1."""
+        video path: the striped encoder, or a full-frame encoder with software
+        encoding forced by use_cpu or gpu_id=-1."""
         forced = bool(self.use_cpu[0]) or str(self.gpu_id).strip() == "-1"
-        return codec_for_encoder(self.encoder) == "h264" and software_video_path(self.encoder, forced)
+        return software_video_path(self.encoder, forced)
+
+    def software_encoder_in_use(self) -> Optional[str]:
+        """The software encoder a session on the software path encodes with,
+        by the pixelflux build's table; None off that path or without one."""
+        if not self.on_software_video_path():
+            return None
+        return software_encoders().get(codec_for_encoder(self.encoder))
 
     def resolve_rate_control_default(self) -> None:
         """Apply the transport's rate-control default for the current mode.
@@ -1561,7 +1563,7 @@ class AppSettings:
         pixelflux build — targets a bandwidth, so a session known to be on the
         software path defaults to CBR; encoders not listed keep their value.
         The dashboards derive the same default client-side
-        (conditional-settings.js) from the published `software_h264_encoder`.
+        (conditional-settings.js) from the published `software_encoders`.
 
         A no-op when the operator pinned rate_control_mode or disabled rate
         control. Called again on a live transport switch so an unpinned mode
@@ -1571,7 +1573,7 @@ class AppSettings:
             return
         if self.mode == "webrtc":
             self.rate_control_mode = "cbr"
-        elif self.on_software_h264_path() and software_h264_encoder() == "openh264":
+        elif self.software_encoder_in_use() == "openh264":
             self.rate_control_mode = "cbr"
         else:
             self.rate_control_mode = self.ENCODER_RC_DEFAULTS.get(
