@@ -5036,12 +5036,13 @@ class DataStreamingServer(BaseStreamingService):
             if not screen_name:
                 # A server with no connected RandR output (a GPU without a
                 # display engine, a driver told to use none) has no mode to
-                # set and no monitor to publish: its framebuffer is sized
-                # outright where the server allows, and the layouts are
-                # clamped to what it has otherwise.
+                # set: its framebuffer is sized outright where the server
+                # allows, and the layouts are clamped to what it has
+                # otherwise. The monitors below are still what gives the
+                # toolkits their screens, and carry no output there.
                 data_logger.info(
                     "No connected RandR output on this X server; the desktop is sized as a bare "
-                    "framebuffer, with no monitor per display.")
+                    "framebuffer, and its displays are monitors carrying no output.")
             elif total_mode_str not in available_resolutions:
                 data_logger.info(f"Mode {total_mode_str} not found. Creating it.")
                 # Native first: a mode made by per-invocation xrandr dies with its
@@ -5089,13 +5090,12 @@ class DataStreamingServer(BaseStreamingService):
                         data_logger.warning(f"Live re-target failed for '{did}' ({e}); restarting it.")
                         keep_ids.discard(did)
                         await self._stop_capture_for_display(did)
-            if screen_name:
-                data_logger.info("Swapping logical monitors to the new layout...")
-                # Monitors go in before the framebuffer change, at their final
-                # rectangles and under a server grab: window managers re-tile on
-                # every root ConfigureNotify and must never see a monitor-less
-                # or partial set.
-                await replace_selkies_monitors(layouts, screen_name=screen_name)
+            data_logger.info("Swapping logical monitors to the new layout...")
+            # Monitors go in before the framebuffer change, at their final
+            # rectangles and under a server grab: window managers re-tile on
+            # every root ConfigureNotify and must never see a monitor-less
+            # or partial set.
+            await replace_selkies_monitors(layouts, screen_name=screen_name)
             # A mode change is the dominant cost of a reconfigure (CRTC reprogram,
             # every client repaints), so a same-size reload skips it. A live
             # re-target that grew the framebuffer above still shrinks here.

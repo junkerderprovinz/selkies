@@ -249,6 +249,21 @@ def _connected_output_state(
     raise RuntimeError("no connected RandR output")
 
 
+def _first_connected_output(d: x11_display.Display) -> Optional[int]:
+    """The first connected RandR output on ``d``, or None where the server has none.
+
+    Modes belong to an output, so the mode paths need one and raise without it.
+    Logical monitors do not: a server whose driver reports no display device --
+    a GPU with no display engine -- still carries a framebuffer to define them
+    over, and they are the only screens the toolkits will find there.
+    """
+    try:
+        _, _, out_id, _, _ = _connected_output_state(d)
+        return out_id
+    except RuntimeError:
+        return None
+
+
 def _sync_query_randr() -> Tuple[str, List[str], str]:
     """Blocking RandR query on the module connection.
 
@@ -656,7 +671,7 @@ def _sync_list_monitors() -> List[str]:
 
 def _monitor_info(
     d: x11_display.Display,
-    out_id: int,
+    out_id: Optional[int],
     name: str,
     x: int,
     y: int,
@@ -667,10 +682,11 @@ def _monitor_info(
     """Build the RRSetMonitor request dict for logical monitor ``name``.
 
     ``take_output`` lists the (single) connected physical output on this
-    monitor. GTK3's X11 backend realizes a GdkMonitor only for a RandR
-    monitor that carries a live output, so a monitor without one is invisible
-    to every GTK app and their desktops paint and tile short of that region —
-    which is why every monitor asks for it. Whether the server lets them all
+    monitor, and a server that has none lists nothing whatever it asks for.
+    GTK3's X11 backend realizes a GdkMonitor only for a RandR monitor that
+    carries a live output, so a monitor without one is invisible to every GTK
+    app and their desktops paint and tile short of that region — which is why
+    every monitor asks for it. Whether the server lets them all
     keep it is a property of the server (`_sync_set_selkies_layout`), so a
     caller that has measured a refusal passes False for the rest.
 
@@ -691,7 +707,7 @@ def _monitor_info(
         "height_in_pixels": int(h),
         "width_in_millimeters": max(1, round(w * 25.4 / (_APPLIED_DPI if _APPLIED_DPI is not None else 96.0))),
         "height_in_millimeters": max(1, round(h * 25.4 / (_APPLIED_DPI if _APPLIED_DPI is not None else 96.0))),
-        "crtcs": [out_id] if take_output else [],
+        "crtcs": [out_id] if (take_output and out_id is not None) else [],
     }
 
 
@@ -732,7 +748,8 @@ def _sync_set_monitor(name: str, x: int, y: int, w: int, h: int,
     with _x11_lock:
         try:
             d = _module_display()
-            root, _, out_id, _, _ = _connected_output_state(d)
+            root = d.screen().root
+            out_id = _first_connected_output(d)
             randr.set_monitor(root, _monitor_info(d, out_id, name, x, y, w, h, take_output))
             d.sync()
             _verify_monitors_on_display(
@@ -759,11 +776,18 @@ def _sync_delete_monitor(name: str) -> None:
 
 
 def _sync_set_output_primary() -> None:
-    """Blocking RandR set-output-primary (first connected output)."""
+    """Blocking RandR set-output-primary (first connected output).
+
+    A no-op on a server with no output, where the logical monitors carry the
+    primary flag and nothing else can.
+    """
     with _x11_lock:
         try:
             d = _module_display()
-            root, _, out_id, _, _ = _connected_output_state(d)
+            root = d.screen().root
+            out_id = _first_connected_output(d)
+            if out_id is None:
+                return
             randr.set_output_primary(root, out_id)
             d.sync()
         except Exception as e:
@@ -846,6 +870,7 @@ def _monitors_match(
     live: Dict[str, Tuple[int, int, int, int, bool, bool]],
     desired: Dict[str, Tuple[int, int, int, int]],
     share_output: bool,
+    has_output: bool = True,
 ) -> bool:
     """Whether the live selkies-* set already is what a publish would define:
     the same rectangles, the primary flag on the primary, and the output where
@@ -854,11 +879,15 @@ def _monitors_match(
         return False
     if "selkies-primary" in desired and not live["selkies-primary"][5]:
         return False
+    if not has_output:
+        return all(not m[4] for m in live.values())
     return all(m[4] == (share_output or name == "selkies-primary")
                for name, m in live.items())
 
 
-def _sync_announce_monitor_change(d: x11_display.Display, root: Any, out_id: int) -> None:
+def _sync_announce_monitor_change(
+    d: x11_display.Display, root: Any, out_id: Optional[int]
+) -> None:
     """Emit the RandR event a toolkit re-reads its monitor set on.
 
     RRSetMonitor emits no RandR event: the server sends core ConfigureNotify on
@@ -870,10 +899,16 @@ def _sync_announce_monitor_change(d: x11_display.Display, root: Any, out_id: int
     is the one RRNotify carrying no geometry, physical size or CRTC of its own,
     and the server emits it even for an unchanged value.
 
+    A server with no output carries no property to bump, so nothing is sent
+    there; the framebuffer resize a swap on such a server is part of emits its
+    own event, which is what makes the new set visible.
+
     Advisory, and synced here so a failure surfaces inside it: a set that is
     right but unannounced is no reason to report the swap as failed.
     """
     global _MONITOR_SERIAL
+    if out_id is None:
+        return
     _MONITOR_SERIAL = (_MONITOR_SERIAL + 1) & 0x7FFFFFFF
     try:
         randr.change_output_property(
@@ -886,7 +921,7 @@ def _sync_announce_monitor_change(d: x11_display.Display, root: Any, out_id: int
 
 
 def _sync_set_selkies_layout(
-    d: x11_display.Display, root: Any, out_id: int,
+    d: x11_display.Display, root: Any, out_id: Optional[int],
     ordered: List[Tuple[str, Dict[str, int]]], share_output: bool,
 ) -> Dict[str, Tuple[int, int, int, int, bool, bool]]:
     """Define the whole selkies-* set from scratch; returns what survived.
@@ -936,14 +971,17 @@ def _sync_replace_selkies_monitors(layouts: Dict[str, Dict[str, int]]) -> None:
     with _x11_lock:
         try:
             d = _module_display()
-            root, _, out_id, _, _ = _connected_output_state(d)
+            root = d.screen().root
+            out_id = _first_connected_output(d)
             desired = {
                 f"selkies-{did}": (int(l["x"]), int(l["y"]), int(l["w"]), int(l["h"]))
                 for did, l in layouts.items()
             }
             ordered = sorted(layouts.items(), key=lambda kv: kv[0] != "primary")
             share = _OUTPUT_SHARED is not False
-            if _monitors_match(_sync_selkies_monitors(d, root), desired, share):
+            if _monitors_match(
+                _sync_selkies_monitors(d, root), desired, share, out_id is not None
+            ):
                 return
             d.grab_server()
             try:
@@ -962,7 +1000,8 @@ def _sync_replace_selkies_monitors(layouts: Dict[str, Dict[str, int]]) -> None:
                 # primary screen, and these monitors all list the one output
                 # (`_monitor_info`), so with several displays no output is
                 # primary and the monitor flag alone names the primary.
-                randr.set_output_primary(root, out_id if len(layouts) == 1 else 0)
+                if out_id is not None:
+                    randr.set_output_primary(root, out_id if len(layouts) == 1 else 0)
                 _sync_announce_monitor_change(d, root, out_id)
             finally:
                 # Flushed, not just queued: an X error aborting the sequence
@@ -988,8 +1027,8 @@ def _sync_announce_current_monitors() -> None:
     with _x11_lock:
         try:
             d = _module_display()
-            root, _, out_id, _, _ = _connected_output_state(d)
-            _sync_announce_monitor_change(d, root, out_id)
+            root = d.screen().root
+            _sync_announce_monitor_change(d, root, _first_connected_output(d))
         except Exception as e:
             logger_app_resize.debug(f"Could not announce the monitor-set change ({e}).")
 
@@ -1345,12 +1384,44 @@ async def list_selkies_monitors() -> List[str]:
     return [n for n in await list_logical_monitors() if "selkies-" in n]
 
 
+def _sync_restore_framebuffer_monitor() -> bool:
+    """Define one monitor covering the framebuffer, where the server has no output.
+
+    Returns whether one was defined. A server whose driver exposes an output
+    keeps a screen of its own once the layout monitors are gone, so nothing is
+    defined there.
+    """
+    with _x11_lock:
+        try:
+            d = _module_display()
+            if _first_connected_output(d) is not None:
+                return False
+            root = d.screen().root
+            geom = root.get_geometry()
+            randr.set_monitor(root, _monitor_info(
+                d, None, "selkies-primary", 0, 0, int(geom.width), int(geom.height), False))
+            d.sync()
+            return True
+        except Exception as e:
+            if not isinstance(e, x11_error.XError):
+                _drop_module_display()
+            logger_app_resize.info(f"Could not define a monitor over the framebuffer ({e}).")
+            return False
+
+
 async def clear_selkies_monitors() -> None:
-    """Delete every logical monitor this software created (selkies-*)."""
+    """Delete every logical monitor this software created (selkies-*).
+
+    A server with no connected output has no screen of its own to fall back to:
+    its monitors are the only ones the toolkits see, so one covering the
+    framebuffer takes the layout's place rather than leaving the desktop with
+    nowhere to put a window.
+    """
     names = await list_selkies_monitors()
     for monitor_name in names:
         await delete_logical_monitor(monitor_name)
-    if names:
+    restored = await asyncio.to_thread(_sync_restore_framebuffer_monitor)
+    if names and not restored:
         await announce_monitor_change()
 
 
@@ -1450,9 +1521,13 @@ async def apply_extended_layout(
     total_mode = f"{total_w}x{total_h}"
     curr_res, _, available, _, screen_name = await get_new_res(total_mode)
     if not screen_name:
-        logger_app_resize.error("Could not determine output name; cannot apply layout.")
-        return False
-    if total_mode not in (available or []):
+        # No output means no mode to create or set, and the framebuffer alone is
+        # what the resize below sizes; the monitors are still what gives the
+        # toolkits their screens, so the layout goes on.
+        logger_app_resize.info(
+            "No connected RandR output on this X server; the desktop is laid out on the "
+            "framebuffer alone.")
+    elif total_mode not in (available or []):
         if not await ensure_mode(total_mode):
             try:
                 _, modeline = await generate_xrandr_gtf_modeline(total_mode)
