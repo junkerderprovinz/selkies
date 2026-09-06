@@ -43,6 +43,7 @@ import inspect
 import base64
 import contextlib
 import gzip
+import importlib.metadata
 import hmac
 import json
 import logging
@@ -248,16 +249,28 @@ except (ImportError, RuntimeError) as e:
     data_logger.warning("pcmflux library not found. Audio capture is unavailable. (%s)", e)
 
 try:
+    import pixelflux
     from pixelflux import CaptureSettings, ScreenCapture
 
+    # The codec API this tree drives; an older build would fail on every
+    # capture start and client connect instead of once, here.
+    if not hasattr(pixelflux, "SOFTWARE_ENCODERS") or not hasattr(CaptureSettings(), "codec"):
+        try:
+            installed = importlib.metadata.version("pixelflux")
+        except Exception:
+            installed = "unknown version"
+        raise RuntimeError(
+            f"pixelflux {installed} predates the codec API (SOFTWARE_ENCODERS, "
+            "CaptureSettings.codec) this Selkies is built against; install the "
+            "pixelflux release Selkies pins")
     X11_CAPTURE_AVAILABLE = True
     data_logger.info("pixelflux library found. Striped encoding modes available.")
 except (ImportError, RuntimeError) as e:
     # RuntimeError is pixelflux ABI/version skew: degrade instead of crashing at startup.
     ScreenCapture = CaptureSettings = None
     X11_CAPTURE_AVAILABLE = False
-    data_logger.warning(
-        f"pixelflux library unavailable ({e}). Striped encoding modes unavailable."
+    data_logger.error(
+        f"pixelflux library unavailable ({e}). Video capture is unavailable."
     )
 
 upload_path: str = str(getattr(settings, 'file_manager_path', '') or '~/Desktop')

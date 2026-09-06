@@ -56,9 +56,11 @@ def resolved(software_encoder: str = "", **env: str) -> str:
     return probe("print(s.settings.rate_control_mode)", software_encoder, **env)
 
 
+# On the x264 build every websockets encoder is quality-driven; the OpenH264
+# build's software-path exceptions are checked below with that build stubbed.
 for encoder, want in [("h264enc", "crf"), ("h264enc-striped", "crf"), ("jpeg", "crf"),
                       ("h265enc", "crf"), ("vp8enc", "crf"), ("vp9enc", "crf"), ("av1enc", "crf")]:
-    got = resolved(SELKIES_MODE="websockets", SELKIES_ENCODER=encoder)
+    got = resolved("x264", SELKIES_MODE="websockets", SELKIES_ENCODER=encoder)
     check(f"websockets {encoder} defaults to {want}", got == want, got)
 
 got = resolved(SELKIES_MODE="webrtc")
