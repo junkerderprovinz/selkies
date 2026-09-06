@@ -118,9 +118,10 @@ import { detectKeyboardLayout } from './lib/keyboard-layout.js';
 import { installAuthGuard } from './lib/auth-guard.js';
 import { installSessionCookie, sessionAuthHeaders } from './lib/session-token.js';
 import { storageKeyForServerKey, resolveSpec, HIDPI_SPEC } from './lib/conditional-settings.js';
-import { getRoutePrefix, getStorageAppName, canDecodeEncoder, canDecodeFullColor } from './lib/util.js';
+import { getRoutePrefix, getStorageAppName, canDecodeEncoder, canDecodeFullColor, h264Framing, h264FramingReady } from './lib/util.js';
 import {
   wireCodecName, wireFrameIsKey, codecOfEncoder, codecCarriesFullColor, codecStringFor,
+  avcDescription, annexbToAvcc, sameBytes,
 } from './lib/wire-codecs.js';
 // The same module by source, for the video worker's own copy of it.
 import wireCodecsSource from './lib/wire-codecs.js?raw';
@@ -1286,10 +1287,10 @@ function present(f) {
 function closeDecoder() {
   if (dec) { try { if (dec.state !== 'closed') dec.close(); } catch (_) {} dec = null; }
   decKey = false; decNeedKey = false;
-  wireCodec = null; wireW = 0; wireH = 0;
+  wireCodec = null; wireW = 0; wireH = 0; wireDesc = null;
 }
 
-function configureDecoder(codec, w, h, software) {
+function configureDecoder(codec, w, h, software, description) {
   closeDecoder();
   try {
     dec = new VideoDecoder({ output: present, error: () => { closeDecoder(); self.postMessage({ type: 'decoderError' }); } });
@@ -1299,6 +1300,7 @@ function configureDecoder(codec, w, h, software) {
     // and the pinned SPS level keeps it from re-initializing mid-stream.
     const cfg = { codec: codec, codedWidth: w, codedHeight: h, optimizeForLatency: true };
     if (software) cfg.hardwareAcceleration = 'prefer-software';
+    if (description) cfg.description = description;
     dec.configure(cfg);
     // A keyframe is required after (re)configure.
     decNeedKey = true;
@@ -1326,6 +1328,10 @@ function decodeChunk(key, data, timestamp) {
 // and acceleration preference. Wire stats go up once a second for the page's
 // counters, watchdogs and fps, with the row layout this side is decoding.
 let wireCodec = null, wireW = 0, wireH = 0, wireHint = null, wireSoftware = false, wireChromium = false;
+// H.264 as this engine takes it: Annex B as sent, or length-prefixed NAL units
+// behind the key frame's avcC description where Annex B is refused.
+let wireAvcc = false, wireDesc = null;
+const avcFramed = (codec) => wireAvcc && typeof codec === 'string' && codec.startsWith('avc1');
 // The codec the page's encoder streams; frames of another are the stream it
 // just left, still in flight, and must not build (and lose) a decoder here.
 let wireExpect = null;
@@ -1478,10 +1484,14 @@ function onH264Stripe(buffer) {
   if (payload.byteLength === 0) return;
   let info = stripeDecs[y];
   let codec = info ? info.codec : null;
-  if (key) codec = codecStringFor(wireCodecName(head[1]), new Uint8Array(payload), w, h, 0, false, wireChromium);
+  const bytes = new Uint8Array(payload);
+  if (key) codec = codecStringFor(wireCodecName(head[1]), bytes, w, h, 0, false, wireChromium);
   else if (!codec) codec = wireHint;
   if (!codec) { sendNeedKey('no_codec'); return; }
-  if (!info || info.dec.state !== 'configured' || info.w !== w || info.h !== h || info.codec !== codec) {
+  const framed = avcFramed(codec);
+  const desc = key && framed ? avcDescription(bytes) : (info ? info.desc : null);
+  if (!info || info.dec.state !== 'configured' || info.w !== w || info.h !== h || info.codec !== codec
+      || (key && framed && !sameBytes(desc, info.desc))) {
     // Only a keyframe may (re)configure a row: deltas against a lost state are noise.
     if (!key) { sendNeedKey('no_key'); return; }
     if (info) { try { if (info.dec.state !== 'closed') info.dec.close(); } catch (err) {} }
@@ -1497,13 +1507,14 @@ function onH264Stripe(buffer) {
     try {
       const cfg = { codec: codec, codedWidth: w, codedHeight: h, optimizeForLatency: true };
       if (wireSoftware) cfg.hardwareAcceleration = 'prefer-software';
+      if (desc) cfg.description = desc;
       dec.configure(cfg);
     } catch (err) {
       try { if (dec.state !== 'closed') dec.close(); } catch (e2) {}
       onStripeError(y);
       return;
     }
-    info = stripeDecs[y] = { dec: dec, w: w, h: h, codec: codec, gotKey: false, meta: [] };
+    info = stripeDecs[y] = { dec: dec, w: w, h: h, codec: codec, desc: desc, gotKey: false, meta: [] };
   }
   if (!key && !info.gotKey) { sendNeedKey('no_key'); return; }
   if (!key && info.dec.decodeQueueSize > STRIPE_DECODE_QUEUE_LIMIT) {
@@ -1514,7 +1525,8 @@ function onH264Stripe(buffer) {
   }
   try {
     info.meta.push({ frameId: frameId });
-    info.dec.decode(new EncodedVideoChunk({ type: key ? 'key' : 'delta', timestamp: performance.now() * 1000, data: payload }));
+    const data = framed ? annexbToAvcc(bytes) : payload;
+    info.dec.decode(new EncodedVideoChunk({ type: key ? 'key' : 'delta', timestamp: performance.now() * 1000, data: data }));
     if (key) info.gotKey = true;
   } catch (err) {
     info.meta.pop();
@@ -1580,18 +1592,22 @@ function onWire(buffer) {
   wireChunks++;
   if (frameId !== wireLastId) { wireFrames++; wireLastId = frameId; }
   const payload = buffer.slice(10);
+  const bytes = new Uint8Array(payload);
   let codec = wireCodec;
-  if (key) codec = codecStringFor(wireCodecName(head[1]), new Uint8Array(payload), w, h, 0, false, wireChromium);
+  if (key) codec = codecStringFor(wireCodecName(head[1]), bytes, w, h, 0, false, wireChromium);
   else if (!codec) codec = wireHint;
   if (!codec) { sendNeedKey('no_codec'); return; }
-  if (!dec || dec.state !== 'configured' || codec !== wireCodec || w !== wireW || h !== wireH) {
+  const framed = avcFramed(codec);
+  const desc = key && framed ? avcDescription(bytes) : wireDesc;
+  if (!dec || dec.state !== 'configured' || codec !== wireCodec || w !== wireW || h !== wireH
+      || (key && framed && !sameBytes(desc, wireDesc))) {
     // Only a keyframe may (re)configure: deltas against a lost state are noise.
     if (!key) { sendNeedKey('no_key'); return; }
-    if (!configureDecoder(codec, w, h, wireSoftware)) return;
-    wireCodec = codec; wireW = w; wireH = h;
+    if (!configureDecoder(codec, w, h, wireSoftware, desc)) return;
+    wireCodec = codec; wireW = w; wireH = h; wireDesc = desc;
     self.postMessage({ type: 'wireDims', w: w, h: h });
   }
-  decodeChunk(key, payload, performance.now() * 1000);
+  decodeChunk(key, framed ? annexbToAvcc(bytes) : payload, performance.now() * 1000);
 }
 
 const stripedCaps = {
@@ -1612,7 +1628,7 @@ if (typeof VideoTrackGenerator !== 'undefined') {
 self.onmessage = (e) => {
   const m = e.data;
   if (m.canvas) { oc = m.canvas; ctx = oc.getContext('2d', { desynchronized: true }); if (!mode) mode = 'canvas'; return; }
-  if (m.type === 'decoderConfig') { configureDecoder(m.codec, m.codedWidth, m.codedHeight, m.software); return; }
+  if (m.type === 'decoderConfig') { configureDecoder(m.codec, m.codedWidth, m.codedHeight, m.software, m.description || null); return; }
   if (m.type === 'closeDecoder') { closeDecoder(); return; }
   if (m.type === 'chunk') {
     // Not ready yet; the page will resend a keyframe.
@@ -1623,6 +1639,7 @@ self.onmessage = (e) => {
     if (m.codecHint) wireHint = m.codecHint;
     wireSoftware = !!m.software;
     wireChromium = !!m.chromium;
+    wireAvcc = !!m.avcc;
     wirePort = m.port;
     m.port.onmessage = (ev) => onWire(ev.data);
     if (!wireStatsTimer) {
@@ -1671,6 +1688,7 @@ self.onmessage = (e) => {
     if (m.codecHint) wireHint = m.codecHint;
     if (m.software !== undefined) wireSoftware = !!m.software;
     if (m.chromium !== undefined) wireChromium = !!m.chromium;
+    if (m.avcc !== undefined) wireAvcc = !!m.avcc;
     return;
   }
   // Fallback: a main-thread-decoded frame transferred in.
@@ -1829,6 +1847,7 @@ function wireSocketToVideoWorker() {
     videoWorker.postMessage({
       type: 'wireIn', port: channel.port1,
       codecHint: workerKeyframeCodec, software: preferSoftwareDecode, chromium: isChromium,
+      avcc: h264Framing() === 'avcc',
     }, [channel.port1]);
     websocket.connectVideo(channel.port2);
   } catch (e) {
@@ -2194,14 +2213,20 @@ function feedWorkerDecoder(isKey, dataBuf, w, h, codec) {
   if (workerDecodeFailed) return false;
   if (!ensureVideoWorker()) return false;
   if (!activateWorkerSinkDisplay()) return false;
+  const framed = h264Framing() === 'avcc' && codec.startsWith('avc1');
   if (codec !== workerDecoderCodec || w !== workerDecoderW || h !== workerDecoderH) {
+    if (framed && !isKey) { requestKeyframe(); return true; }
     logWorkerDecoderConfig(codec, w, h);
-    try { videoWorker.postMessage({ type: 'decoderConfig', codec: codec, codedWidth: w, codedHeight: h, software: preferSoftwareDecode }); }
-    catch (e) { return false; }
+    const description = framed ? avcDescription(new Uint8Array(dataBuf)) : null;
+    try {
+      videoWorker.postMessage({ type: 'decoderConfig', codec: codec, codedWidth: w, codedHeight: h,
+                                software: preferSoftwareDecode, description: description });
+    } catch (e) { return false; }
     workerDecoderCodec = codec; workerDecoderW = w; workerDecoderH = h;
     requestKeyframe();
   }
-  try { videoWorker.postMessage({ type: 'chunk', key: isKey, data: dataBuf, timestamp: performance.now() * 1000 }, [dataBuf]); }
+  const data = framed ? annexbToAvcc(new Uint8Array(dataBuf)).buffer : dataBuf;
+  try { videoWorker.postMessage({ type: 'chunk', key: isKey, data: data, timestamp: performance.now() * 1000 }, [data]); }
   catch (e) { return false; }
   return true;
 }
@@ -6017,6 +6042,7 @@ class WorkerWebSocket {
   websocket.onopen = async () => {
     console.log('[websockets] Connection opened!');
     await settleFullColorSupport();
+    if (await h264FramingReady === 'avcc') console.info('[Selkies] H.264 decodes here with an avcC description; frames are reframed for it.');
     wsEverOpened = true;
     try { sessionStorage.removeItem('selkies_mode_flip'); } catch (e) { /* ignore */ }
     status = 'connected_waiting_mode';
@@ -6366,7 +6392,10 @@ class WorkerWebSocket {
                 requestKeyframe();
                 return;
             }
-            if (!decoderInfo || decoderInfo.decoder.state === 'closed' ||
+            // A reframed row is rebuilt on a key frame whose parameter sets changed too.
+            const reframed = decoderInfo && decoderInfo.framed && isKeyFrame
+                && !sameBytes(avcDescription(new Uint8Array(h264Payload)), decoderInfo.description);
+            if (!decoderInfo || decoderInfo.decoder.state === 'closed' || reframed ||
                 (decoderInfo.decoder.state === 'configured' && (decoderInfo.width !== stripeWidth || decoderInfo.height !== stripeHeight))) {
 
                 if(decoderInfo && decoderInfo.decoder.state !== 'closed') {
@@ -6378,17 +6407,22 @@ class WorkerWebSocket {
                     error: (e) => handleStripeDecodeError(e, vncStripeYStart)
                 });
                 const dynamicCodec = wireCodecString(video_frame_type_byte, h264Payload, stripeWidth, stripeHeight);
+                const framed = h264Framing() === 'avcc' && dynamicCodec.startsWith('avc1');
+                const description = framed ? avcDescription(new Uint8Array(h264Payload)) : null;
                 const decoderConfig = decoderConfigFor({
                     codec: dynamicCodec,
                     codedWidth: stripeWidth,
                     codedHeight: stripeHeight,
-                    optimizeForLatency: true
+                    optimizeForLatency: true,
+                    ...(description ? { description } : {})
                 });
                 vncStripeDecoders[vncStripeYStart] = {
                     decoder: newStripeDecoder,
                     pendingChunks: [],
                     width: stripeWidth,
                     height: stripeHeight,
+                    framed: framed,
+                    description: description,
                     hasReceivedKeyframe: false
                 };
                 decoderInfo = vncStripeDecoders[vncStripeYStart];
@@ -6436,7 +6470,7 @@ class WorkerWebSocket {
                 const chunkData = {
                     type: chunkType,
                     timestamp: chunkTimestamp,
-                    data: h264Payload
+                    data: decoderInfo.framed ? annexbToAvcc(new Uint8Array(h264Payload)) : h264Payload
                 };
                 if (decoderInfo.decoder.state === "configured") {
                     const chunk = new EncodedVideoChunk(chunkData);

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Every video codec, decoded by each browser engine, over both transports.
 
-For each codec past H.264 the server is started with ``SELKIES_ENCODER`` set to
+For each codec the server is started with ``SELKIES_ENCODER`` set to
 its encoder and the page opens in Chromium, Firefox or WebKit. Over WebSockets
 the stream must come up and the painted picture decode whatever the engine can
 do: an engine whose WebCodecs decoder takes the codec keeps it (the page's
@@ -35,7 +35,8 @@ import core_lib as C
 import test_encoders as TENC
 from playwright.sync_api import sync_playwright
 
-CODECS = [("h265enc", "H265", "hev1.1.6.L93.B0", "video/H265"),
+CODECS = [("h264enc", "H264", "avc1.64001F", "video/H264"),
+          ("h265enc", "H265", "hev1.1.6.L93.B0", "video/H265"),
           ("vp8enc", "VP8", "vp8", "video/VP8"),
           ("vp9enc", "VP9", "vp09.00.31.08", "video/VP9"),
           ("av1enc", "AV1", "av01.0.05M.08", "video/AV1")]

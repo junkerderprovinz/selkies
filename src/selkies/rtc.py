@@ -2029,7 +2029,8 @@ class RTCApp:
 
         The browser encodes its camera with its own WebRTC encoder (hardware
         where it has one) and the depacketized frames — Annex-B H.264 or
-        H.265, VP8 or VP9 — go straight to pixelflux, which decodes them off the GIL; no
+        H.265, VP8 or VP9, AV1 temporal units reassembled across packets — go
+        straight to pixelflux, which decodes them off the GIL; no
         Python decode and no data-channel chunking. When the decoder asks for a
         keyframe (after a drop or a late start) the request becomes a PLI.
 
@@ -2047,7 +2048,7 @@ class RTCApp:
         cam_tx = peer_connection.addTransceiver("video", direction="recvonly")
         try:
             caps = RTCRtpSender.getCapabilities("video")
-            wanted = ("video/h264", "video/vp8", "video/vp9", "video/h265", "video/rtx")
+            wanted = ("video/h264", "video/vp8", "video/vp9", "video/h265", "video/av1", "video/rtx")
             preferred = [c for c in caps.codecs if c.mimeType.lower() in wanted]
             if preferred:
                 cam_tx.setCodecPreferences(preferred)
@@ -2076,9 +2077,13 @@ class RTCApp:
                     logger.info("Dropping webcam video from a peer without webcam authority.")
                 return
             data = getattr(frame, "data", b"") or b""
-            codec_id = CODEC_BY_NAME.get(str(getattr(codec, "name", "")).lower())
+            name = str(getattr(codec, "name", "")).lower()
+            codec_id = CODEC_BY_NAME.get(name)
             if not data or codec_id is None:
                 return
+            if state.get("codec") != name:
+                state["codec"] = name
+                logger.info(f"Webcam uplink carries {name}.")
             if webcam.needs_ensure(codec_id):
                 if not state["starting"]:
                     state["starting"] = True

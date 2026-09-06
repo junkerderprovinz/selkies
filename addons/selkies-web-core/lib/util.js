@@ -68,7 +68,7 @@ export class Queue {
     }
 }
 
-import { PROBE_CODEC_STRINGS, PROBE_FULLCOLOR_STRINGS, codecOfEncoder, codecCarriesFullColor } from "./wire-codecs.js";
+import { H264_ANNEXB_SAMPLE, PROBE_CODEC_STRINGS, PROBE_FULLCOLOR_STRINGS, codecOfEncoder, codecCarriesFullColor } from "./wire-codecs.js";
 export { codecOfEncoder, codecCarriesFullColor };
 
 /**
@@ -147,6 +147,49 @@ export const decoderSupportReady = (async () => {
     decoderSupport = answers;
     return answers;
 })();
+
+/**
+ * How this engine's `VideoDecoder` takes H.264: `annexb` where a key frame in
+ * Annex B form decodes (Chromium, Firefox), `avcc` where it is refused and an
+ * `avcC` description with length-prefixed NAL units is needed instead (WebKit).
+ * Asked once, of a 16x16 key frame, in a worker so a slow refusal never holds
+ * the page; `annexb` without WebCodecs or when nothing answers.
+ * @type {Promise<string>}
+ */
+export const h264FramingReady = (async () => {
+    if (typeof VideoDecoder === "undefined") return "annexb";
+    const probe = `self.onmessage = async (e) => {
+        let outputs = 0;
+        try {
+            const dec = new VideoDecoder({ output: (f) => { outputs++; f.close(); }, error: () => {} });
+            dec.configure({ codec: 'avc1.42000A', codedWidth: 16, codedHeight: 16, optimizeForLatency: true });
+            dec.decode(new EncodedVideoChunk({ type: 'key', timestamp: 0, data: e.data }));
+            await dec.flush();
+            dec.close();
+        } catch (err) { /* refused: the count says so */ }
+        self.postMessage(outputs > 0 ? 'annexb' : 'avcc');
+    };`;
+    const sample = Uint8Array.from(atob(H264_ANNEXB_SAMPLE), (c) => c.charCodeAt(0));
+    const answer = await new Promise((resolve) => {
+        let worker = null;
+        const settle = (value) => { resolve(value); if (worker) { try { worker.terminate(); } catch (err) { /* gone */ } } };
+        const timer = setTimeout(() => settle("annexb"), 5000);
+        try {
+            worker = new Worker(URL.createObjectURL(new Blob([probe], { type: "text/javascript" })));
+            worker.onmessage = (e) => { clearTimeout(timer); settle(e.data); };
+            worker.onerror = () => { clearTimeout(timer); settle("annexb"); };
+            worker.postMessage(sample.buffer, [sample.buffer]);
+        } catch (err) {
+            clearTimeout(timer);
+            settle("annexb");
+        }
+    });
+    h264FramingAnswer = answer;
+    return answer;
+})();
+let h264FramingAnswer = "annexb";
+/** @returns {string} The framing `h264FramingReady` settled on; `annexb` until it has. */
+export const h264Framing = () => h264FramingAnswer;
 
 /**
  * Whether this engine can play an encoder on the WebSocket transport: every

@@ -1344,7 +1344,7 @@ export default function webrtc() {
 	/**
 	 * Starts the webcam uplink: the camera track rides the sendonly video
 	 * transceiver the server reserved in the bundled SDP (the mirror of the
-	 * microphone), so the browser's own encoder produces the H.264 or VP8 the
+	 * microphone), so the browser's own encoder produces the H.264, VP8, VP9, H.265 or AV1 the
 	 * server's virtual camera decodes, with RTP congestion control and no
 	 * data-channel framing.
 	 */

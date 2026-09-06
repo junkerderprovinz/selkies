@@ -4,11 +4,11 @@
 Every packet stays within the MTU, a frame's key-frame flag is read from its
 own bitstream, and the depayloaders rebuild what the packers cut up: H.265
 through single NAL units, aggregation packets and fragmentation units, VP9
-through its payload descriptor. AV1 is send-only, so its packets are checked
-against the payload format itself: the aggregation header's element count and
-continuation bits, LEB128 lengths ahead of every element but a counted
-packet's last, no temporal delimiter, no size fields, and a re-assembly of the
-elements that gives the OBUs back.
+through its payload descriptor, AV1 through the frame assembler that joins
+one OBU's fragments across packets and restores the size fields, and whose
+packets are also checked against the payload format itself: the aggregation
+header's element count and continuation bits, LEB128 lengths ahead of every
+element but a counted packet's last, no temporal delimiter, no size fields.
 """
 import os
 import sys
@@ -17,9 +17,9 @@ from fractions import Fraction
 sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "src"))
 
-from selkies.webrtc.codecs import CODECS, depayload, get_encoder  # noqa: E402
+from selkies.webrtc.codecs import CODECS, depayload, frame_assembler, get_encoder  # noqa: E402
 from selkies.webrtc.codecs.av1 import (  # noqa: E402
-    Av1Encoder, av1_is_key, av1_obus, leb128, read_leb128,
+    Av1Encoder, av1_assemble, av1_is_key, av1_obus, leb128, read_leb128,
 )
 from selkies.webrtc.codecs.base import EncodedPacket  # noqa: E402
 from selkies.webrtc.codecs.h264 import PACKET_MAX  # noqa: E402
@@ -213,11 +213,24 @@ payloads, _, _ = enc.pack(packet(small))
 check("av1: small OBUs share one packet with a counted W and an unprefixed last element",
       len(payloads) == 1 and (payloads[0][0] >> 4) & 3 == 2 and payloads[0][1] == 3
       and payloads[0][-41:] == b"\x30" + b"\x07" * 40, payloads[0][:4].hex())
-try:
-    depayload(codec("video/av1"), payloads[0])
-    check("av1: not depayloaded", False)
-except ValueError:
-    check("av1: not depayloaded", True)
+check("av1: packets depayload as they are, the frame assembler joins them",
+      depayload(codec("video/av1"), payloads[0]) == payloads[0]
+      and frame_assembler(codec("video/av1")) is av1_assemble
+      and frame_assembler(codec("video/vp9")) is None)
+payloads, _, _ = enc.pack(packet(tu_key))
+check("av1: the assembled key unit is the packed one, delimiter restored, padding gone",
+      av1_assemble([depayload(codec("video/av1"), p) for p in payloads]) == td + seq + key_frame,
+      len(payloads))
+payloads, _, _ = enc.pack(packet(tu_delta))
+check("av1: the assembled delta unit is the packed one",
+      av1_assemble(payloads) == td + delta_frame)
+payloads, _, _ = enc.pack(packet(tu_key))
+check("av1: continuations whose start is missing are dropped, the unit stays well formed",
+      len(payloads) > 2 and av1_assemble(payloads[1:]) == td, len(payloads))
+seq_sized, frame_sized = obu(1, b"\x00\x00\x00\x04\x3e\x7f\xff\xe8"), obu(6, b"\x10" + bytes(48))
+sized_payloads = [bytes([0x20]) + leb128(len(seq_sized)) + seq_sized + frame_sized]
+check("av1: an element that kept its size field passes through unchanged",
+      av1_assemble(sized_payloads) == td + seq_sized + frame_sized)
 
 
 # --- H.264 / VP8 key-frame flags -------------------------------------------

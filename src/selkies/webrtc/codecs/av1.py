@@ -3,14 +3,23 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #
-"""AV1 RTP payload format (AOM, v1.0) packetization of temporal units. The
-temporal delimiter, tile lists and padding go; every other OBU becomes an
-element without its size field. Elements fill packets behind a one-byte
-aggregation header (Z: the first element continues an OBU from the previous
-packet, Y: the last continues in the next, W: the element count when three or
-fewer, N: the first packet of a coded video sequence), a LEB128 length ahead of
-every element but a counted packet's last, and an OBU larger than the room a
-packet has left is split across as many packets as it needs."""
+"""AV1 RTP payload format (AOM, v1.0) packetization of temporal units, and the
+reassembly of a received frame's packets back into one.
+
+Packing: the temporal delimiter, tile lists and padding go; every other OBU
+becomes an element without its size field. Elements fill packets behind a
+one-byte aggregation header (Z: the first element continues an OBU from the
+previous packet, Y: the last continues in the next, W: the element count when
+three or fewer, N: the first packet of a coded video sequence), a LEB128 length
+ahead of every element but a counted packet's last, and an OBU larger than the
+room a packet has left is split across as many packets as it needs.
+
+Assembly runs over a frame's packets in sequence order once the jitter buffer
+has them all: fragments are joined across packets by the Y and Z flags, each
+OBU gets the size field the elements travel without, and a temporal delimiter
+opens the unit, which is then the low-overhead bitstream the virtual camera's
+decoder reads. A fragment whose start was lost with a packet is dropped, as
+are the rest of that OBU's fragments."""
 
 from typing import Union
 
@@ -98,6 +107,65 @@ def av1_is_key(obus: list[tuple[int, bytes, Buffer]]) -> bool:
 
 class Av1Decoder(Decoder):
     pass
+
+
+def _obu_elements(payload: bytes) -> tuple[bool, bool, list[bytes]]:
+    """A packet's Z and Y flags and its OBU elements, sizes read off."""
+    header = payload[0]
+    w = (header >> 4) & 3
+    pos = 1
+    elements: list[bytes] = []
+    while pos < len(payload):
+        if w == 0 or len(elements) < w - 1:
+            size, pos = read_leb128(payload, pos)
+        else:
+            size = len(payload) - pos
+        if pos + size > len(payload):
+            raise ValueError("OBU element is truncated")
+        elements.append(payload[pos : pos + size])
+        pos += size
+    return bool(header & 0x80), bool(header & 0x40), elements
+
+
+def _sized_obu(obu: bytes) -> bytes:
+    """An OBU element with the size field the bitstream format wants."""
+    header = obu[0]
+    header_size = 2 if header & 0x04 else 1
+    if header & 0x02 or len(obu) < header_size:
+        return obu
+    return bytes([header | 0x02]) + obu[1:header_size] + leb128(len(obu) - header_size) + obu[header_size:]
+
+
+def av1_assemble(payloads: list[bytes]) -> bytes:
+    """The temporal unit a frame's packets carry, in the low-overhead bitstream
+    format: a temporal delimiter, then every OBU element made whole across
+    packets and given its size field."""
+    out = bytearray(b"\x12\x00")
+    pending = bytearray()
+    for payload in payloads:
+        if not payload:
+            continue
+        try:
+            continues, continued, elements = _obu_elements(payload)
+        except ValueError:
+            pending = bytearray()
+            continue
+        for index, element in enumerate(elements):
+            first = index == 0
+            last = index == len(elements) - 1
+            if first and continues:
+                if not pending:
+                    # The OBU's start went with a lost packet; so does its rest.
+                    continue
+                pending += element
+            else:
+                pending = bytearray(element)
+            if last and continued:
+                continue
+            if pending:
+                out += _sized_obu(bytes(pending))
+            pending = bytearray()
+    return bytes(out)
 
 
 class Av1Encoder(Encoder):

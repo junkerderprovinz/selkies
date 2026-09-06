@@ -45,7 +45,9 @@ from ..rtcrtpparameters import (
 from .base import Decoder, Encoder
 from .g711 import PcmaDecoder, PcmaEncoder, PcmuDecoder, PcmuEncoder
 from .g722 import G722Decoder, G722Encoder
-from .av1 import Av1Decoder, Av1Encoder
+from collections.abc import Callable
+
+from .av1 import Av1Decoder, Av1Encoder, av1_assemble
 from .h264 import H264Decoder, H264Encoder, h264_depayload
 from .h265 import H265Decoder, H265Encoder, h265_depayload
 from .opus import OpusDecoder, OpusEncoder
@@ -236,10 +238,18 @@ def depayload(codec: RTCRtpCodecParameters, payload: bytes) -> bytes:
     elif name == "H265":
         return h265_depayload(payload)
     elif name == "AV1":
-        # Fragments of one OBU span packets; nothing here reassembles them.
-        raise ValueError("AV1 is not received")
+        # One OBU's fragments span packets: the frame assembler joins them.
+        return payload
     else:
         return payload
+
+
+def frame_assembler(codec: RTCRtpCodecParameters) -> Optional[Callable[[list[bytes]], bytes]]:
+    """The function that turns a frame's depayloaded packets into its bitstream,
+    for a codec whose packets cannot simply be joined; None for the rest."""
+    if codec.name.upper() == "AV1":
+        return av1_assemble
+    return None
 
 
 def get_capabilities(kind: str) -> RTCRtpCapabilities:

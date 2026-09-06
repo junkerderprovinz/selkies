@@ -352,6 +352,73 @@ export const codecStringFor = (codec, keyframe, width, height, fps, is444, chrom
  * level the encoders emit for a 720p stream, for asking an engine what it can
  * decode before any stream exists.
  */
+/**
+ * A 16x16 Baseline key frame in Annex B form, for asking a decoder whether it
+ * takes H.264 without an `avcC` description.
+ */
+export const H264_ANNEXB_SAMPLE = 'AAAAAWdCwArd7ARAAAADAEAAAA8DxIngAAAAAWjOD8gAAAABZYiEOiYoDg==';
+
+/**
+ * The `avcC` record of an Annex B key frame's SPS and PPS, for a decoder that
+ * takes H.264 only with a description; null when either is missing.
+ * @param {Uint8Array} bytes
+ * @returns {Uint8Array|null}
+ */
+export const avcDescription = (bytes) => {
+  let sps = null;
+  let pps = null;
+  for (const nal of annexbNals(bytes)) {
+    const type = nal[0] & 0x1f;
+    if (type === 7 && !sps) sps = nal;
+    else if (type === 8 && !pps) pps = nal;
+  }
+  if (!sps || !pps) return null;
+  const out = new Uint8Array(11 + sps.length + pps.length);
+  out.set([1, sps[1], sps[2], sps[3], 0xff, 0xe1, sps.length >> 8, sps.length & 0xff], 0);
+  out.set(sps, 8);
+  out.set([1, pps.length >> 8, pps.length & 0xff], 8 + sps.length);
+  out.set(pps, 11 + sps.length);
+  return out;
+};
+
+/**
+ * An Annex B access unit as length-prefixed NAL units, the framing an `avcC`
+ * description implies, without its parameter sets and delimiters.
+ * @param {Uint8Array} bytes
+ * @returns {Uint8Array}
+ */
+export const annexbToAvcc = (bytes) => {
+  const nals = annexbNals(bytes).filter((nal) => {
+    const type = nal[0] & 0x1f;
+    return type !== 7 && type !== 8 && type !== 9;
+  });
+  let size = 0;
+  for (const nal of nals) size += 4 + nal.length;
+  const out = new Uint8Array(size);
+  let pos = 0;
+  for (const nal of nals) {
+    out[pos] = nal.length >>> 24;
+    out[pos + 1] = (nal.length >>> 16) & 0xff;
+    out[pos + 2] = (nal.length >>> 8) & 0xff;
+    out[pos + 3] = nal.length & 0xff;
+    out.set(nal, pos + 4);
+    pos += 4 + nal.length;
+  }
+  return out;
+};
+
+/**
+ * @param {Uint8Array|null} a
+ * @param {Uint8Array|null} b
+ * @returns {boolean} Whether both are absent or byte-for-byte equal.
+ */
+export const sameBytes = (a, b) => {
+  if (!a || !b) return !a && !b;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+};
+
 export const PROBE_CODEC_STRINGS = {
   h264: 'avc1.42E01E',
   h265: 'hev1.1.6.L93.B0',

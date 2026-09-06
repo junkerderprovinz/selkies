@@ -383,7 +383,7 @@ export class WebRTCClient {
 
 	/**
 	 * Enables or disables the webcam: attaches a getUserMedia video track to
-	 * the reserved sendonly transceiver (the browser encodes H.264 or VP8 over
+	 * the reserved sendonly transceiver (the browser encodes H.264, VP8, VP9, H.265 or AV1 over
 	 * RTP and the server's virtual camera decodes it), or detaches and stops
 	 * it. Disabling also deactivates the sender's encodings, because a null or
 	 * ended track alone does not silence every engine (Firefox keeps the
