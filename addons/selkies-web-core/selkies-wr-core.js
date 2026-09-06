@@ -86,6 +86,7 @@ import { installAuthGuard } from './lib/auth-guard.js';
 import { installSessionCookie, sessionAuthHeaders } from './lib/session-token.js';
 import { storageKeyForServerKey } from './lib/conditional-settings.js';
 import { getRoutePrefix, getStorageAppName, canDecodeFullColor } from './lib/util.js';
+import { WEBCAM_ENCODER_PREFERENCES } from './lib/webcam-capture.js';
 
 installAuthGuard();
 installSessionCookie();
@@ -347,6 +348,8 @@ export default function webrtc() {
 	let isWebcamActive = false;
 	let webcamBusy = false;
 	let preferredWebcamDeviceId = null;
+	/** `webcam_encoder`: the codec the camera sender is set to among the negotiated ones. */
+	let webcamEncoderPreference = 'auto';
 	let isGamepadEnabled = true;
 
 	/**
@@ -1354,7 +1357,7 @@ export default function webrtc() {
 		}
 		webcamBusy = true;
 		try {
-			const ok = await webrtc.setWebcam(true, preferredWebcamDeviceId);
+			const ok = await webrtc.setWebcam(true, preferredWebcamDeviceId, { codec: webcamEncoderPreference });
 			if (ok) {
 				const track = webrtc.webcamTrack;
 				if (track) {
@@ -1742,6 +1745,14 @@ export default function webrtc() {
 		const storeInt = fromServer ? () => {} : setIntParam;
 		const storeBool = fromServer ? () => {} : setBoolParam;
 		const storeString = fromServer ? () => {} : setStringParam;
+		if (settings.webcam_encoder !== undefined) {
+			const preference = String(settings.webcam_encoder);
+			if (WEBCAM_ENCODER_PREFERENCES.includes(preference) && preference !== webcamEncoderPreference) {
+				webcamEncoderPreference = preference;
+				storeString('webcam_encoder', preference);
+				if (webrtc && isWebcamActive) webrtc.setWebcamCodec(preference).catch(() => {});
+			}
+		}
 		if (settings.debug !== undefined) {
 			debug = settings.debug;
 			// Persisted even from the server: the reload only settles once the flag is in storage.
@@ -2875,6 +2886,13 @@ export default function webrtc() {
 				}
 				console.log("Received server settings payload:", obj.settings);
 				const changes = sanitizeAndStoreSettings(obj.settings);
+				const wce = obj.settings && obj.settings.webcam_encoder;
+				if (wce && WEBCAM_ENCODER_PREFERENCES.includes(wce.value)) {
+					const stored = getStringParam('webcam_encoder', wce.value);
+					webcamEncoderPreference = wce.locked || !WEBCAM_ENCODER_PREFERENCES.includes(stored)
+						? wce.value : stored;
+					if (webrtc && isWebcamActive) webrtc.setWebcamCodec(webcamEncoderPreference).catch(() => {});
+				}
 				const ce = obj.settings && obj.settings.command_enabled;
 				serverCommandEnabled = (ce && typeof ce.value === 'boolean') ? ce.value : true;
 				if (!startPolicyApplied) {

@@ -951,8 +951,8 @@ SETTING_DEFINITIONS: List[Dict[str, Any]] = [
         "name": "webcam_encoder",
         "type": "enum",
         "default": "auto",
-        "meta": {"allowed": ["auto", "h264", "vp8", "mjpeg"]},
-        "help": 'Codec WebSocket clients encode the webcam uplink with. "auto" runs the measured ladder (H.264, else VP8, JPEG when neither keeps up) on engines that stream camera frames through MediaStreamTrackProcessor, and JPEG on the `<video>`-element path (Firefox): its software encoders can hold the camera rate while costing a full core, which no client-side probe can price. "h264" or "vp8" run that one codec on every path, trading client CPU for a fraction of the uplink bandwidth, still falling to JPEG where it cannot keep up or encodes the wrong colours; "mjpeg" pins JPEG everywhere. Clients may override per user unless the value is locked; the WebRTC transport encodes in the browser and ignores this.',
+        "meta": {"allowed": ["auto", "h264", "h265", "vp8", "vp9", "av1", "mjpeg"]},
+        "help": 'Codec clients encode the webcam uplink with. Over WebSockets "auto" runs the measured ladder (H.264, else VP8, then VP9, AV1 and H.265 where the engine encodes them, JPEG when none keeps up) on engines that stream camera frames through MediaStreamTrackProcessor, and JPEG on the `<video>`-element path (Firefox): its software encoders can hold the camera rate while costing a full core, which no client-side probe can price. A codec name runs that one codec on every path, trading client CPU for a fraction of the uplink bandwidth, still falling to JPEG where it cannot keep up or encodes the wrong colours; "mjpeg" pins JPEG everywhere. Over WebRTC the browser sends its camera as the named codec when the answer negotiated it, and otherwise, as for "auto" and "mjpeg", as the first codec negotiated. Clients may override per user unless the value is locked.',
     },
     {
         "name": "webcam_device",
@@ -1109,6 +1109,15 @@ ENCODER_CODECS = {
 
 # The name each pixelflux codec goes by in logs and notices.
 CODEC_LABELS = {"jpeg": "JPEG", "h264": "H.264", "h265": "H.265", "vp8": "VP8", "vp9": "VP9", "av1": "AV1"}
+
+
+def encoder_for_codec(codec: str) -> str:
+    """The full-frame encoder that streams `codec`, which is what the capture's
+    selection ladder demotes to; H.264 for a codec nothing streams."""
+    for encoder, streamed in ENCODER_CODECS.items():
+        if streamed == codec and encoder != "h264enc-striped":
+            return encoder
+    return "h264enc"
 
 
 def codec_for_encoder(encoder: str) -> str:

@@ -55,7 +55,7 @@ from enum import Enum
 from abc import ABCMeta, abstractmethod
 from typing import Any, Callable, Optional, Tuple
 
-from .settings import codec_for_encoder, settings as app_settings
+from .settings import codec_for_encoder, encoder_for_codec, settings as app_settings
 from .audio_control import AudioControl
 from .display_utils import (
     apply_common_capture_settings,
@@ -227,6 +227,9 @@ class MediaPipelinePixel(MediaPipeline):
             "unhandled produce_data"
         )
         self.on_pipeline_started: Callable[[], None] = lambda: None
+        # A capture that could not build its codec's encoder streams H.264 instead;
+        # told the encoder it now runs, once frames flow.
+        self.on_encoder_demoted: Callable[[str], None] = lambda encoder: None
         self.on_cursor_data: Callable[[dict], None] = lambda data: None
         self.get_cursor_size_cap: Callable[[], int] = lambda: 0
 
@@ -599,11 +602,38 @@ class MediaPipelinePixel(MediaPipeline):
             )
             self._is_screen_capturing = True
             logger.info("Started screen capture module")
+            self._schedule_active_codec_settle()
         except Exception as e:
             logger.error(f"Failed to start screen capture: {e}", exc_info=True)
             self.capture_module = None
             self._is_screen_capturing = False
             raise MediaPipelineError(f"screen capture failed to start: {e}") from e
+
+    def _schedule_active_codec_settle(self, attempt: int = 0) -> None:
+        """Read back, once frames flow, the codec the capture streams, and report a
+        demotion through `on_encoder_demoted` so the senders and clients follow."""
+        self.async_event_loop.call_later(
+            1.0, lambda: asyncio.ensure_future(self._settle_active_codec(attempt)))
+
+    async def _settle_active_codec(self, attempt: int) -> None:
+        module = self.capture_module
+        if module is None or not self._is_screen_capturing or not hasattr(module, "active_codec"):
+            return
+        try:
+            active = await asyncio.to_thread(module.active_codec)
+        except Exception as e:
+            logger.debug(f"Active codec unknown: {e}")
+            return
+        if active is None:
+            if attempt < 5:
+                self._schedule_active_codec_settle(attempt + 1)
+            return
+        if codec_for_encoder(self.encoder) == active:
+            return
+        demoted = encoder_for_codec(active)
+        logger.warning(f"The capture streams {active} as '{demoted}': no encoder served '{self.encoder}'.")
+        self.encoder = demoted
+        self.on_encoder_demoted(demoted)
 
     async def update_capture_region(self, x: int, y: int, w: int, h: int) -> None:
         """Re-target the capture to a new region of the extended framebuffer.

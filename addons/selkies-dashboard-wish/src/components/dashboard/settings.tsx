@@ -121,7 +121,7 @@ const encoderOptions = [
  * allowed list is already filtered to what the webrtc pipeline produces.
  */
 /** `webcam_encoder` values; labels come from `displayLabel`. */
-const webcamEncoderOptions = ["auto", "h264", "vp8", "mjpeg"];
+const webcamEncoderOptions = ["auto", "h264", "h265", "vp8", "vp9", "av1", "mjpeg"];
 
 const encoderOptionsRTC = [
     "h264enc",

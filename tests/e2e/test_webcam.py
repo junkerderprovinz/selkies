@@ -675,7 +675,7 @@ def detail_block() -> "H.Results":
 
 
 # Uplink codec ids, as the frame header carries them.
-CODEC_IDS = {"mjpeg": 0, "jpeg": 0, "h264": 1, "avc": 1, "vp8": 2}
+CODEC_IDS = {"mjpeg": 0, "jpeg": 0, "h264": 1, "avc": 1, "vp8": 2, "vp9": 3, "av1": 4, "h265": 5}
 
 WIRE_CODEC_JS = "window.__codecs = {};\n" + C.wire_hook_js("""
   if (data instanceof ArrayBuffer && data.byteLength > 3) {
@@ -724,6 +724,60 @@ def encoderpref_block() -> "H.Results":
                 browser.close()
         finally:
             H.server_stop()
+    # The codecs past VP8 come from Chromium's own WebCodecs encoders, so a pin
+    # to one of them must come out of the device as that codec's id alone.
+    for pref, want in (("vp9", {3}), ("av1", {4})):
+        H.server_start(mode="websockets", wayland=False,
+                       extra_env={"SELKIES_WEBCAM_ENABLED": "false", "SELKIES_WEBCAM_PIXEL_FORMAT": "I420",
+                                  "SELKIES_WEBCAM_ENCODER": pref})
+        try:
+            with sync_playwright() as p:
+                browser, page, errors = launch(p, "chromium", cam.sock_dir, "websockets", init_js=WIRE_CODEC_JS)
+                res.check(f"chromium {pref}: stream up", bool(C.wait_ws_video(page)), "")
+                toggle(page, True)
+                res.check(f"chromium {pref}: webcam reports active", wait_status(page, True),
+                          str(page.evaluate("window.__camStatus")))
+                r = wait_for_picture([((640, 360), GREEN)])
+                res.check(f"chromium {pref}: device shows the camera's green",
+                          near(r["samples"].get((640, 360)), GREEN), str(r.get("samples")))
+                codecs = page.evaluate("window.__codecs") or {}
+                got = {int(k) for k, v in codecs.items() if v > 5}
+                if not got:
+                    got = {CODEC_IDS.get(page.evaluate("window.webcamCodec"))} - {None}
+                res.check(f"chromium {pref}: wire codec is {sorted(want)}", got == want,
+                          str(codecs) or str(page.evaluate("window.webcamCodec")))
+                res.check(f"chromium {pref}: no page errors", not errors, "; ".join(errors)[:200])
+                browser.close()
+        finally:
+            H.server_stop()
+    cam.stop()
+    return res
+
+
+def webrtcpref_block() -> "H.Results":
+    """`webcam_encoder` over WebRTC: the camera sender is set to the named codec
+    among the ones the answer negotiated, so the server's uplink carries it."""
+    res = H.Results("webcam-webrtcpref")
+    cam = PublishedCamera(flat_frames()).start()
+    for pref in ("vp9", "av1"):
+        H.server_start(mode="webrtc", wayland=False,
+                       extra_env={"SELKIES_WEBCAM_ENABLED": "false", "SELKIES_WEBCAM_PIXEL_FORMAT": "I420",
+                                  "SELKIES_WEBCAM_ENCODER": pref})
+        try:
+            with sync_playwright() as p:
+                browser, page, errors = launch(p, "chromium", cam.sock_dir, "webrtc")
+                res.check(f"{pref}: stream up", bool(C.wait_wr_video(page)), "")
+                toggle(page, True)
+                res.check(f"{pref}: webcam reports active", wait_status(page, True),
+                          str(page.evaluate("window.__camStatus")))
+                res.check(f"{pref}: the uplink carries {pref}", C.wait_log(f"Webcam uplink carries {pref}.", timeout=10), "")
+                r = wait_for_picture([((640, 360), GREEN)])
+                res.check(f"{pref}: device shows the camera's green",
+                          near(r["samples"].get((640, 360)), GREEN), str(r.get("samples")))
+                res.check(f"{pref}: no page errors", not errors, "; ".join(errors)[:200])
+                browser.close()
+        finally:
+            H.server_stop()
     cam.stop()
     return res
 
@@ -743,6 +797,8 @@ def main() -> int:
         ok = detail_block().summary()
     elif sel == "av1":
         ok = av1_block().summary()
+    elif sel == "webrtcpref":
+        ok = webrtcpref_block().summary()
     elif sel == "encoderpref":
         ok = encoderpref_block().summary()
     else:

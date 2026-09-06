@@ -103,7 +103,7 @@ from .input_handler import (
     VIEWER_SILENT_DROP_PREFIXES,
     run_client_command,
 )
-from .settings import settings, SETTING_DEFINITIONS, WS_MAX_MESSAGE_BYTES, WS_MESSAGE_SIZE_HARD_CAP, build_client_settings_payload, codec_for_encoder, effective_use_cpu, inflate_gz_bounded, pipeline_starts_on, sanitize_client_setting
+from .settings import settings, CODEC_LABELS, SETTING_DEFINITIONS, WS_MAX_MESSAGE_BYTES, WS_MESSAGE_SIZE_HARD_CAP, build_client_settings_payload, codec_for_encoder, effective_use_cpu, encoder_for_codec, inflate_gz_bounded, pipeline_starts_on, sanitize_client_setting
 from .settings import settings as app_settings
 from .webcam import (
     MSG_WEBCAM_DISABLED,
@@ -5564,12 +5564,50 @@ class DataStreamingServer(BaseStreamingService):
                 data_logger.warning(
                     f"Capture started for '{display_id}' with a caveat: {last_error}")
             data_logger.info(f"SUCCESS: Capture started for '{display_id}'.")
+            self._schedule_active_codec_settle(display_id)
             return True
 
         except Exception as e:
             data_logger.error(f"Failed to start capture for '{display_id}': {e}", exc_info=True)
             self._close_video_relays(display_id)
             return False
+
+    def _schedule_active_codec_settle(self, display_id: str, attempt: int = 0) -> None:
+        """Read back, once frames flow, the codec a fresh capture streams.
+
+        The selection ladder demotes a codec no encoder could serve to H.264 with
+        a log line; the clients must then hear the encoder they really receive,
+        so the display's setting follows and the settings are re-announced.
+        """
+        loop = asyncio.get_running_loop()
+        loop.call_later(1.0, lambda: asyncio.ensure_future(self._settle_active_codec(display_id, attempt)))
+
+    async def _settle_active_codec(self, display_id: str, attempt: int) -> None:
+        module = (self.capture_instances.get(display_id) or {}).get('module')
+        if module is None or not hasattr(module, "active_codec"):
+            return
+        try:
+            active = await asyncio.to_thread(module.active_codec)
+        except Exception as e:
+            data_logger.debug(f"Active codec of '{display_id}' unknown: {e}")
+            return
+        if active is None:
+            if attempt < 5:
+                self._schedule_active_codec_settle(display_id, attempt + 1)
+            return
+        entry = self.display_clients.get(display_id)
+        encoder = (entry or {}).get('encoder') or self.app.encoder
+        if codec_for_encoder(encoder) == active:
+            return
+        demoted = encoder_for_codec(active)
+        data_logger.warning(
+            f"Display '{display_id}' streams {CODEC_LABELS.get(active, active)} as '{demoted}': "
+            f"no encoder served '{encoder}'.")
+        if entry is not None:
+            entry['encoder'] = demoted
+        if display_id == 'primary':
+            self.app.encoder = demoted
+        await self._broadcast_live_server_settings(display_id)
 
     async def _wayland_start_verdict(self, module: Any, display_id: str) -> Tuple[bool, Optional[str]]:
         """Read the truthful outcome of a Wayland capture start.
