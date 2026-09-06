@@ -1300,7 +1300,7 @@ class RTCApp:
                 break
 
         if not rtx_codec:
-            raise ValueError(f"RTX codec for {forced_codec_mime} not found")
+            raise ValueError(f"RTX codec for {preferred_mime} not found")
 
         flexfec_codec = next(
             (
