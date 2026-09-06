@@ -1326,6 +1326,9 @@ function decodeChunk(key, data, timestamp) {
 // and acceleration preference. Wire stats go up once a second for the page's
 // counters, watchdogs and fps, with the row layout this side is decoding.
 let wireCodec = null, wireW = 0, wireH = 0, wireHint = null, wireSoftware = false, wireChromium = false;
+// The codec the page's encoder streams; frames of another are the stream it
+// just left, still in flight, and must not build (and lose) a decoder here.
+let wireExpect = null;
 let wireChunks = 0, wireFrames = 0, wireLastId = -1, wireStatsTimer = null;
 // The codec helpers by source: a bundler renames the module bindings they
 // share, which a stringified function would carry in here unresolved.
@@ -1569,6 +1572,7 @@ function onWire(buffer) {
   }
   if (buffer.byteLength < 11) return;
   const head = new Uint8Array(buffer, 0, 10);
+  if (wireExpect && wireCodecName(head[1]) !== wireExpect) return;
   const key = wireFrameIsKey(head[1]);
   const frameId = (head[2] << 8) | head[3];
   const w = (head[6] << 8) | head[7];
@@ -1639,6 +1643,7 @@ self.onmessage = (e) => {
   }
   if (m.type === 'wireMode') {
     const striped = !!m.striped;
+    wireExpect = m.codec || null;
     if (striped !== stripedOn) {
       stripedOn = striped;
       // The sink re-announces in the new mode, so the page re-hides its
@@ -1853,7 +1858,9 @@ function updateVideoDivert(force) {
     videoWorkerReady && !workerDecodeFailed &&
     (striped ? stripedReady : (decodeInWorker && isFullFrameVideo(currentEncoderMode))));
   if (videoWorker) {
-    try { videoWorker.postMessage({ type: 'wireMode', striped }); } catch (e) { /* respawns fresh */ }
+    try {
+      videoWorker.postMessage({ type: 'wireMode', striped, codec: striped ? null : codecOfEncoder(currentEncoderMode) });
+    } catch (e) { /* respawns fresh */ }
   }
   // The striped flag is part of the state: a full-frame divert rolling into a
   // striped one keeps `on` but changes the ack source and the sink upkeep.
@@ -2425,6 +2432,11 @@ function answerRefusedCodec(label, codec) {
         console.warn(`This browser has no decoder for ${label}; switching to the ${next} encoder.`);
         currentEncoderMode = next;
         setStringParam('encoder', next);
+        // The worker takes the next stream from its first frame, whatever the
+        // refused one did to it; the refused stream's stragglers it drops.
+        workerDecodeFailed = false;
+        workerDecoderCodec = null; workerDecoderW = 0; workerDecoderH = 0;
+        workerKeyframeCodec = null;
         updateVideoDivert();
         sendFullSettingsUpdateToServer(`no decoder for ${label}`);
         return;
@@ -8116,6 +8128,21 @@ function initiateFallback(error, context) {
     if (performance.now() - softwareDecodeSwitchedAt < SOFTWARE_DECODE_SETTLE_MS) {
         console.warn(`[initiateFallback] Ignoring decoder error (Context: ${context}) from the decoders the software switch replaced.`);
         return;
+    }
+    // An engine that takes the configuration and refuses the stream at decode
+    // (WebKit does for AV1): a codec with a rung below it steps the ladder the
+    // way a refused configuration does, rather than reloading into the crash
+    // count.
+    const codec = codecOfEncoder(currentEncoderMode);
+    if (!isSharedMode && isFullFrameVideo(currentEncoderMode) && codec !== 'h264') {
+        if (codecRefusalPending) return;
+        answerRefusedCodec(`${codec} (refused at decode)`, codec);
+        if (codecRefusalPending) {
+            softwareDecodeAttempted = false;
+            rememberSoftwareDecode(false);
+            clearAllVncStripeDecoders();
+            return;
+        }
     }
     console.error(`FATAL DECODER ERROR (Context: ${context}).`, error);
     if (window.isFallingBack) return;

@@ -8,7 +8,9 @@ do: an engine whose WebCodecs decoder takes the codec keeps it (the page's
 encoder stays the requested one and the server's stream line names the codec),
 one that refuses it steps down the client's ladder to ``h264enc`` and the
 picture still decodes there. The engine's own answer to
-``VideoDecoder.isConfigSupported`` decides which of the two is required. Over
+``VideoDecoder.isConfigSupported`` decides which of the two is required, except
+that an engine which takes the configuration and refuses the stream at decode
+(the page says so) is held to the refusal outcome. Over
 WebRTC the engine's own RTP receiver decides (``RTCRtpReceiver.getCapabilities``):
 a codec it takes is negotiated and streamed, one it declines is answered with
 H.264 and the display moves to ``h264enc``, logged by the server.
@@ -109,6 +111,8 @@ def block_codec(mode: str, wayland: bool, engine: str, encoder: str, mode_name: 
         picture.paint()
         with sync_playwright() as p:
             owner, page = open_engine_page(p, engine, mode)
+            said: list = []
+            page.on("console", lambda m: said.append(m.text))
             try:
                 if mode == "webrtc":
                     taken = page.evaluate(RTP_PROBE_JS, rtp_mime)
@@ -136,6 +140,9 @@ def block_codec(mode: str, wayland: bool, engine: str, encoder: str, mode_name: 
                 res.check(f"{tag}: stream up", bool(video), video)
                 settled = wait_settled_encoder(page)
                 line = TE.last_stream_line()
+                refused_at_decode = any("refused at decode" in t for t in said)
+                if refused_at_decode:
+                    supported = False
                 if supported:
                     res.check(f"{tag}: the engine decodes it, so the codec is kept",
                               settled == encoder, f"page encoder {settled}")
@@ -155,7 +162,8 @@ def block_codec(mode: str, wayland: bool, engine: str, encoder: str, mode_name: 
                 res.check(f"{tag}: frames present", fps > 0, f"fps {fps}")
                 sample = picture.wait(page)
                 res.check(f"{tag}: the painted picture decodes", picture.matches(sample), sample)
-                print(f"      {tag}: probe={'yes' if supported else 'no'} settled={settled} {TE.encoder_field(line)}")
+                print(f"      {tag}: probe={'refused at decode' if refused_at_decode else ('yes' if supported else 'no')}"
+                      f" settled={settled} {TE.encoder_field(line)}")
             finally:
                 owner.close()
     finally:
