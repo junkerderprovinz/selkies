@@ -61,7 +61,9 @@ What the shipped interface *shows* is a server setting rather than a build: `--u
 
 #### Media Capture and Encoding (`pixelflux` and `pcmflux`)
 
-Screen capture and video encoding are performed by [`pixelflux`](https://github.com/selkies-project/pixelflux), a Rust (PyO3) extension. It encodes H.264 with hardware NVENC (NVIDIA) or VA-API (Intel/AMD) when a supported GPU is available, and otherwise falls back to software H.264 — `x264`, or the BSD-licensed OpenH264 in a `pixelflux` built without GPL components — or encodes Motion JPEG. H.265 and AV1 in the capture path are planned but not yet implemented.
+Screen capture and video encoding are performed by [`pixelflux`](https://github.com/selkies-project/pixelflux), a Rust (PyO3) extension. It encodes H.264, H.265, VP8, VP9 and AV1, on hardware NVENC (NVIDIA; H.264, H.265 and AV1) or VA-API (Intel/AMD; all five) when a supported GPU is available, and otherwise on the software encoder its build carries for that codec — `x264` or the BSD-licensed OpenH264 for H.264, `x265` or kvazaar for H.265, libvpx for VP8 and VP9, SVT-AV1 for AV1 — or encodes Motion JPEG.
+
+Frames reach the encoder without a copy wherever the hardware allows it. On Wayland the compositor's dmabuf goes to the encoder as it is. On X11 the same holds on an NVIDIA GPU encoding with NVENC: `pixelflux` captures through NvFBC, so the NVIDIA X driver composites the screen straight into video memory and the encoder reads that buffer in place, which measures 2.51 ms per frame at 1920x1080 against 5.24 ms for the shared-memory path on the same GPU. Every other X11 session copies once, into a shared-memory surface the encoder then reads in place. Nothing needs configuring for any of this; the session says which path it took in its log.
 
 Audio capture and encoding are performed by [`pcmflux`](https://github.com/selkies-project/pcmflux), a companion Rust (PyO3) extension that captures from PulseAudio (or PipeWire-Pulse) and encodes to Opus.
 
